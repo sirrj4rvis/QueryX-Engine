@@ -9,37 +9,37 @@ behavior, not production latencies. Regenerate with
 
 | variant | ops/s |
 |---|---:|
-| heap | 36,074 |
-| btree | 3,655 |
-| hash | 12,022 |
+| heap | 33,013 |
+| btree | 7,759 |
+| hash | 37,306 |
 
 ## Point lookup (ops/s)
 
 | variant | ops/s |
 |---|---:|
-| seqscan | 29 |
-| btree | 2,769 |
-| hash | 9,162 |
+| seqscan | 77 |
+| btree | 8,459 |
+| hash | 21,648 |
 
 ## Range scan, 500-key window (ops/s)
 
 | variant | ops/s |
 |---|---:|
-| seqscan | 10 |
-| btree | 373 |
+| seqscan | 34 |
+| btree | 1,350 |
 
 ## WAL overhead - page writes (ops/s)
 
 | variant | ops/s |
 |---|---:|
-| wal_off | 15,937 |
-| wal_on | 7,785 |
+| wal_off | 70,113 |
+| wal_on | 25,606 |
 
-**WAL overhead:** page writes are ~2.0x slower with logging on (15,937 -> 7,785 ops/s) — the price of crash durability.
+**WAL overhead:** page writes are ~2.7x slower with logging on (70,113 -> 25,606 ops/s) — the price of crash durability.
 
 ## Takeaways
 
-- A hash point lookup is ~**315x** faster than a sequential scan at this size.
+- A hash point lookup is ~**280x** faster than a sequential scan at this size.
 - The B+ tree trails hash on point lookups but is the only index that range-scans.
 - Indexes cost insert throughput to maintain; the WAL costs more, for durability.
 
