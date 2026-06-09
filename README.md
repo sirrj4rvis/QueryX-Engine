@@ -26,6 +26,32 @@ to demonstrate and explain how a relational engine actually works underneath.
 It is a learning-and-portfolio project: the code is written to be read,
 understood, and defended on a whiteboard.
 
+## Highlights
+
+- **Paged storage engine** — fixed 4KB pages, slotted-page record layout, a pager
+  doing all raw disk I/O, and an LRU write-back buffer pool.
+- **Two indexes** — a disk-backed **B+ tree** (split-propagating, range scans via
+  linked leaves) and a **static hash index** (overflow chaining).
+- **SQL front end** — hand-written lexer + recursive-descent parser → typed AST,
+  with a documented [BNF grammar](DESIGN.md#3-sql-grammar-bnf).
+- **Volcano execution** — `open/next/close` operators: scan, filter, project,
+  sort, limit, distinct, scalar + grouped aggregates, and joins.
+- **Cost-based optimizer** — `SeqScan` vs `IndexScan` by estimated page cost,
+  plus `EXPLAIN`.
+- **WAL crash recovery** — log-before-write, CRC-guarded redo replay,
+  checkpointing; recovers data from a corrupted page.
+- **Stretch goals** — `GROUP BY`/`HAVING`, two-table `INNER JOIN`
+  (nested-loop + index-nested-loop), and a workload-driven index advisor.
+- **306 passing tests** and a charted [benchmark suite](benchmarks/REPORT.md).
+
+## Documentation
+
+- **[DESIGN.md](DESIGN.md)** — architecture, BNF grammar, per-phase design
+  decisions, complexity, Postgres/SQLite comparisons, and failure analysis.
+- **[INTERVIEW.md](INTERVIEW.md)** — likely interview questions with model answers.
+- **[RESUME.md](RESUME.md)** — resume bullet points and talking-point soundbites.
+- **[benchmarks/REPORT.md](benchmarks/REPORT.md)** — the benchmark report.
+
 ---
 
 ## Architecture at a glance
