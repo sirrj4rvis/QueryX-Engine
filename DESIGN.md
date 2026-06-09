@@ -608,6 +608,83 @@ deliberately thin.
   uses 0.1 with no way to know better; combined ANDs can compound the error.
   Only an index (with its n_distinct) sharpens the estimate.
 
+### Phase 7 — WAL + Crash Recovery
+
+**Problem solved.** Make writes survive a crash. Until now a crash mid-`write_page`
+could leave a torn page (half-old/half-new) that deserializes to garbage, with no
+way to recover. The write-ahead log closes that gap: log the change durably
+*before* applying it, and replay the log on restart.
+
+**The mechanism.**
+
+- `wal/log.py` — an append-only log of records `[MAGIC | page_no | length |
+  crc32 | data]`. `log_append` writes the page image and flushes it to the OS
+  *before* the data page is written. `records()` replays from the start and
+  stops at the first torn/corrupt record (short header, bad magic, or CRC
+  mismatch), discarding an incomplete tail.
+- `wal/recovery.py` — `replay(wal, apply_page)` REDOes every intact record. Full
+  page images make replay idempotent: reapplying a correct page is harmless;
+  reapplying over a torn page repairs it.
+- `storage/pager.py` integration — every page write goes through `_persist_page`
+  (log, then write). On open, the pager replays its WAL into the data file
+  *before* reading the header (page 0 may itself be a logged page), then
+  checkpoints. A checkpoint fsyncs the data file and truncates the log; it fires
+  on `close()` and automatically once the log passes a size threshold.
+
+**Key decisions and rejected alternatives.**
+
+1. **Physical full-page redo logging.** Idempotent and robust against torn pages.
+   *Rejected:* logical/record-level logging (more compact but replay must re-run
+   operations and handle ordering) — overkill for our scope.
+2. **Redo only, no undo.** We have no multi-statement transactions, so there is
+   nothing to roll back. *Rejected (out of scope):* full ARIES (analysis/redo/
+   undo) — the production answer, but it exists to undo *uncommitted* work.
+3. **Per-pager WAL (one log per data file).** Self-contained, no import cycle
+   (the log is page-size-agnostic and depends on nothing in storage), and enough
+   for per-page durability. *Rejected (out of scope):* a single global WAL with
+   LSNs and commit records spanning all files — required for cross-file
+   (table+index) atomicity, which in turn requires transactions.
+4. **Flush-per-record, fsync-at-checkpoint.** Log records reach the OS
+   immediately (surviving a process crash) and hit the platter at checkpoint.
+   *Rejected (for now):* fsync on every record — correct for power-loss
+   durability but slow; real systems amortize it with group commit. Documented.
+
+**Complexity / scaling.** Each page write costs one extra sequential log append
+(write amplification ~2x). Recovery is O(records since last checkpoint). The
+checkpoint threshold bounds both the log size and recovery time. The dominant new
+cost is the checkpoint fsync; between checkpoints, appends are cheap sequential
+writes.
+
+**PostgreSQL / SQLite comparison.** Postgres has a single cluster-wide WAL with
+LSNs, full-page images on the first write after a checkpoint (then row-level
+deltas), and ARIES-style recovery; SQLite offers a rollback journal and a WAL
+mode, both per-database. QueryX matches the core principle — log-before-write,
+replay-on-open, checkpoint — with per-file logs, full-page images every time, and
+redo-only recovery. The mechanism is faithful; transactions and global ordering
+are the deliberate omissions.
+
+**Failure analysis — concrete scenarios (and how the WAL now handles them).**
+
+- *Torn data-page write — NOW HANDLED.* Crash after the log record is durable but
+  during the data-page write: replay rewrites the full page image. Verified by
+  `test_redo_recovery_restores_corrupted_page`.
+- *Crash mid-log-append — HANDLED.* The partial trailing record fails the
+  length/CRC check and is discarded, so that mutation is atomically absent (the
+  data page was never written either). Verified by
+  `test_torn_trailing_record_is_ignored`.
+- *Cross-file atomicity — STILL OPEN.* A statement that writes a heap page and an
+  index page logs each in its own WAL; a crash between them can leave heap and
+  index disagreeing after independent recovery. Fixing this needs a global log
+  with commit records — i.e. transactions, which are out of scope. This is the
+  most important remaining honesty point.
+- *Checkpoint then crash — consistent.* After a checkpoint the data file is
+  fsynced and the log truncated; a later crash simply finds an empty log and the
+  durable data. Verified by `test_clean_checkpoint_makes_log_redundant`.
+- *fsync gap under power loss.* Because we flush (not fsync) per record, a power
+  loss in the window before a checkpoint can lose the most recent appends. A
+  process crash is fully covered; true power-loss durability would require
+  per-commit fsync (group commit). Documented, not implemented.
+
 ---
 
 ## 5. Future work / out of scope

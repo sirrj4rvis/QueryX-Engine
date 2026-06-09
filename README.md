@@ -8,10 +8,10 @@ built from first principles to expose the internals that production databases
 B+ tree and hash indexing, SQL parsing, volcano-model execution, cost-based
 query optimization, and write-ahead logging with crash recovery.
 
-> **Status:** Phase 6 complete — cost-based optimizer. The planner estimates
-> `SeqScan` vs `IndexScan` cost from table statistics and picks the cheaper path;
-> `EXPLAIN <query>` shows the chosen plan and its cost. Built on the Phase 5
-> execution engine. Built one vertical phase at a time; see below.
+> **Status:** Phase 7 complete — write-ahead logging + crash recovery. Each page
+> write is logged before it is applied; on restart the log is replayed, so a
+> crash mid-write cannot corrupt or lose committed data. This is what makes
+> QueryX a real database. Built one vertical phase at a time; see below.
 
 ---
 
@@ -103,7 +103,7 @@ per-phase engineering notes.
         -> IndexScan using idx_id (btree) on users [id = 500]  (cost=3.4 rows=1)
   (chose IndexScan at cost 3.4; SeqScan alternative cost 7.0)
   ```
-- [ ] **Phase 7** — WAL + crash recovery (redo logging + replay).
+- [x] **Phase 7** — WAL + crash recovery (redo logging + replay).
 - [ ] **Phase 8** — Benchmark suite with matplotlib charts.
 - [ ] **Phase 9** — *(optional)* one stretch goal: adaptive indexing **or** one Tier 3 SQL feature.
 

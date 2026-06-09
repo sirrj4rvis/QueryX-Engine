@@ -35,7 +35,14 @@ from __future__ import annotations
 import os
 import struct
 
+from queryx.wal.log import WriteAheadLog
+from queryx.wal.recovery import replay
+
 from .page import PAGE_SIZE, Page
+
+#: Auto-checkpoint once the WAL grows past this many bytes (~256 pages), to bound
+#: how much must be replayed after a crash and keep the log from growing forever.
+_CHECKPOINT_BYTES = 1 << 20
 
 
 class Pager:
@@ -49,9 +56,8 @@ class Pager:
     #: how many free-page entries (uint32 each) fit in the remainder of page 0
     _MAX_FREE = (PAGE_SIZE - _HEADER_SIZE) // 4  # 1021
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, use_wal: bool = True) -> None:
         self.path = path
-        existed = os.path.exists(path) and os.path.getsize(path) > 0
         if not os.path.exists(path):
             # create the file without truncating an existing one
             open(path, "xb").close()
@@ -59,6 +65,18 @@ class Pager:
         self._file = open(path, "r+b")
         self._closed = False
         self._free_list: list[int] = []
+        self._wal = WriteAheadLog(path + ".wal") if use_wal else None
+
+        # Crash recovery: replay any logged page images into the data file BEFORE
+        # reading the header, since page 0 itself may be among the logged pages.
+        if self._wal is not None:
+            replayed = replay(self._wal, self._apply_recovered_page)
+            if replayed:
+                self._file.flush()
+                os.fsync(self._file.fileno())
+                self._wal.checkpoint()
+
+        existed = os.path.getsize(path) > 0  # after any recovery
         if existed:
             self._load_header()
         else:
@@ -66,17 +84,41 @@ class Pager:
 
     # -- header / page 0 ----------------------------------------------------
 
+    def _persist_page(self, page_no: int, data: bytes) -> None:
+        """Write-ahead, then write: log the page image, then write the data page.
+
+        The log record reaches the OS before the data page is modified, so a
+        crash mid-write is repaired by replay on the next open.
+        """
+        if self._wal is not None:
+            self._wal.log_append(page_no, data)
+        self._file.seek(page_no * PAGE_SIZE)
+        self._file.write(data)
+        self._file.flush()
+        if self._wal is not None and self._wal.size() >= _CHECKPOINT_BYTES:
+            self._checkpoint()
+
+    def _apply_recovered_page(self, page_no: int, data: bytes) -> None:
+        """Write a logged page image during recovery (no per-page flush)."""
+        self._file.seek(page_no * PAGE_SIZE)
+        self._file.write(data)
+
+    def _checkpoint(self) -> None:
+        """Make the data file durable, then discard the now-redundant log."""
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        if self._wal is not None:
+            self._wal.checkpoint()
+
     def _write_header(self) -> None:
-        """Serialize magic, version, and the free list into page 0 and flush."""
+        """Serialize magic, version, and the free list into page 0 and write it."""
         data = bytearray(PAGE_SIZE)
         struct.pack_into(self._HEADER_FMT, data, 0, self._MAGIC, self._VERSION, len(self._free_list))
         pos = self._HEADER_SIZE
         for page_no in self._free_list:
             struct.pack_into("<I", data, pos, page_no)
             pos += 4
-        self._file.seek(0)
-        self._file.write(data)
-        self._file.flush()
+        self._persist_page(0, bytes(data))
 
     def _load_header(self) -> None:
         """Validate the file header and load the free list into memory."""
@@ -122,14 +164,10 @@ class Pager:
     def write_page(self, page_no: int, page: Page) -> None:
         """Write a data page (page_no >= 1) to disk and flush to the OS."""
         self._validate_data_page(page_no)
-        self._file.seek(page_no * PAGE_SIZE)
-        self._file.write(page.to_bytes())
-        self._file.flush()
+        self._persist_page(page_no, page.to_bytes())
 
     def _write_empty_page(self, page_no: int) -> None:
-        self._file.seek(page_no * PAGE_SIZE)
-        self._file.write(Page.empty().to_bytes())
-        self._file.flush()
+        self._persist_page(page_no, Page.empty().to_bytes())
 
     # -- allocation / freeing ----------------------------------------------
 
@@ -167,17 +205,33 @@ class Pager:
     # -- durability / lifecycle --------------------------------------------
 
     def sync(self) -> None:
-        """Force buffered data all the way to the physical disk (fsync)."""
-        self._file.flush()
-        os.fsync(self._file.fileno())
+        """Force buffered data to disk (fsync) and checkpoint the WAL."""
+        self._checkpoint()
+        if self._wal is None:
+            self._file.flush()
+            os.fsync(self._file.fileno())
 
     def close(self) -> None:
-        """Persist the header, fsync, and close the file."""
+        """Persist the header, checkpoint the WAL, and close the files."""
         if self._closed:
             return
         self._write_header()
         self.sync()
+        if self._wal is not None:
+            self._wal.close()
         self._file.close()
+        self._closed = True
+
+    def simulate_crash(self) -> None:
+        """Test/demo helper: drop file handles WITHOUT checkpointing.
+
+        This mimics a process/power crash: the WAL still holds the logged page
+        images (no checkpoint truncated it), so the next Pager opened on this
+        path will replay them and recover. No clean header write, no fsync.
+        """
+        self._file.close()
+        if self._wal is not None:
+            self._wal.close()
         self._closed = True
 
     def __enter__(self) -> "Pager":

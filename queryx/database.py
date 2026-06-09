@@ -117,6 +117,16 @@ class Database:
         self._tables.clear()
         self._indexes.clear()
 
+    def simulate_crash(self) -> None:
+        """Test/demo: abandon all open files WITHOUT checkpointing, leaving each
+        pager's WAL intact so the next open recovers. Mimics a process crash."""
+        for pager, _ in self._tables.values():
+            pager.simulate_crash()
+        for pager, _ in self._indexes.values():
+            pager.simulate_crash()
+        self._tables.clear()
+        self._indexes.clear()
+
     def __enter__(self) -> "Database":
         return self
 
