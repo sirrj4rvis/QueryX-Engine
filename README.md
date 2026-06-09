@@ -3,7 +3,7 @@
 **A relational database engine built from scratch in Python — storage, indexes, SQL, a cost-based optimizer, and crash recovery.**
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![Tests](https://img.shields.io/badge/tests-327%20passing-brightgreen)
+[![tests](https://github.com/sirrj4rvis/QueryX-Engine/actions/workflows/tests.yml/badge.svg)](https://github.com/sirrj4rvis/QueryX-Engine/actions/workflows/tests.yml)
 ![Runtime deps](https://img.shields.io/badge/runtime%20dependencies-0-success)
 ![License](https://img.shields.io/badge/license-MIT-green)
 

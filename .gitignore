@@ -26,6 +26,12 @@ htmlcov/
 *.wal
 *.log
 
+# QueryX runtime database directories (catalog + page/WAL files) created by the
+# shell/demos; these are data, not source.
+mydb/
+queryx_data/
+catalog.json
+
 # Local Claude Code settings (machine-specific; not shared)
 .claude/settings.local.json
 
