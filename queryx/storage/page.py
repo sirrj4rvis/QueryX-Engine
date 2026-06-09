@@ -108,6 +108,18 @@ class Page:
         """Return the page's exact on-disk byte representation."""
         return bytes(self._data)
 
+    def overwrite(self, raw: bytes) -> None:
+        """Replace the entire page buffer with ``raw`` (must be PAGE_SIZE bytes).
+
+        Used by components that store a NON-slotted layout in a page — e.g. the
+        B+ tree's index nodes and meta page — so they can still ride on the
+        buffer pool (cache + write-back) without going through the slot
+        directory. Slotted-page callers never need this.
+        """
+        if len(raw) != PAGE_SIZE:
+            raise ValueError(f"overwrite needs exactly {PAGE_SIZE} bytes, got {len(raw)}")
+        self._data[:] = raw
+
     # -- header accessors ---------------------------------------------------
 
     @property

@@ -222,6 +222,102 @@ LRU, not textbook LRU — I should not claim Postgres "uses LRU".
   into many writes; correctness holds but performance degrades — a thrashing
   buffer pool, mitigated only by sizing capacity sensibly.
 
+### Phase 3 — Index Manager
+
+**Problem solved.** Phase 2's only way to find a row is `heap.scan()` — O(pages),
+the whole table. An index is a separate on-disk structure mapping a key to the
+RowId(s) where matching rows live, so lookups become sub-linear. We build two
+with opposite trade-offs and benchmark them.
+
+**The B+ tree (`btree.py`) — the headline.** A balanced tree whose nodes are
+4KB pages, so fan-out is large and the tree is 2-3 levels deep for millions of
+keys; the cost that matters is *page reads*, O(log_b n) with large base b. All
+data lives in the leaves; internal nodes hold only separator keys; leaves are
+linked in sorted order so a range scan descends once then walks the chain.
+Insertion splits a full leaf and propagates the split upward, growing the tree
+at the root. Supports point lookup, ordered range scan, duplicate keys, and
+leaf-only delete.
+
+**The hash index (`hash_index.py`) — the foil.** Static hashing: a fixed
+directory of N bucket pages (`bucket = stable_hash(key) % N`), each chaining to
+overflow pages when full. O(1) expected point lookup, insert, delete — and *no*
+range scan, because hashing destroys order. Included to make the B+ tree's
+range capability concrete by contrast.
+
+**Key decisions and rejected alternatives.**
+
+1. **B+ tree, not a plain BST, for the primary index.** A binary tree of 1M keys
+   is ~20 levels = ~20 random disk reads per lookup; a B+ tree with hundreds of
+   keys per node is ~3. *Rejected:* in-memory balanced trees (don't survive
+   restart, don't bound disk reads).
+2. **Nodes ride on the buffer pool via `Page.overwrite`.** A node is parsed into
+   an in-memory `_Node`, mutated, then the whole node re-serialized back. This
+   is correctness-first and, usefully, makes the pool's lack of pinning a
+   non-issue (we never depend on a cached Page surviving load→store). *Rejected
+   (deferred):* in-place byte edits — faster, but fiddly and error-prone; the
+   benchmark shows the cost we pay (B+ tree load ~5x slower than hash).
+3. **Static hashing for the hash index.** Simple and fully on-disk. *Rejected
+   (deferred):* extendible / linear hashing that grows the directory — the
+   production answer, but a subsystem of its own.
+4. **Leaf-only delete (no merge/rebalance).** Correct for search because
+   separators need not exist as live data. *Rejected (deferred):* full
+   rebalancing — needed to reclaim space, but out of Phase 3 scope.
+
+**Complexity / scaling.** B+ tree: search/insert/delete O(log_b n) page reads;
+range scan O(log_b n + k/b). Hash: O(1 + chain length) — O(1) at low load
+factor, degrading to O(n/N) as buckets overflow. Where each stops scaling: the
+hash index has a *fixed* bucket count, so a growing dataset lengthens overflow
+chains until lookups crawl; the B+ tree's cost grows only logarithmically but
+its split-heavy insert path (with full-node re-serialization here) is the
+practical bottleneck.
+
+**Benchmark (N=20,000, warm pool).**
+
+| operation | B+ tree | hash index | heap seqscan |
+|---|---|---|---|
+| bulk load (insert) | 7,286 ops/s | 36,635 ops/s | 49,715 ops/s |
+| point lookup | 8,480 ops/s | 23,658 ops/s | 38 ops/s |
+| range scan [500 keys] | 2,205 ops/s | unsupported | (via seqscan) |
+
+Point lookup via hash is ~625x faster than a heap seq scan; the seq scan's 38
+ops/s is the O(rows) wall the indexes exist to break. The hash index cannot
+range-scan at all. (In-process timings, no per-op fsync — they measure
+structure cost, not raw disk latency. Charted suite is Phase 8.)
+
+**PostgreSQL / SQLite comparison.** Both default to B+ trees for indexes
+(Postgres's nbtree, SQLite's table/index B-trees). Postgres also offers a hash
+index access method (historically unlogged/less used); SQLite has no hash index.
+Real B+ trees do prefix compression, right-most-leaf insert fast paths, and full
+rebalancing on delete; real hash indexes grow dynamically. We implement the core
+mechanics and simplify the rest, honestly flagged.
+
+**Failure analysis — concrete scenarios.**
+
+- *Split crash (B+ tree).* A leaf split writes the new right node, relinks the
+  left node's `next_leaf`, and updates the parent — multiple pages, not atomic.
+  A crash after writing the right node but before the parent's new separator/
+  child pointer is flushed leaves an orphaned node: its keys are unreachable
+  from the root (lost data) though the leaf chain may still find them on a scan.
+  **Postgres** logs the split in WAL so recovery completes it atomically; QueryX
+  has no such protection until Phase 7. Today durability holds only against a
+  clean `flush()` + `close()`.
+- *Stale root pointer.* `insert` updates `self._root` and rewrites the meta page
+  after a root split. A crash between the new root's write and the meta-page
+  flush leaves the meta pointing at the *old* root — the tree silently loses the
+  level just added. Again a WAL-atomicity gap.
+- *Hash overflow-chain crash.* `insert` into a full bucket allocates an overflow
+  page, relinks the bucket's `next_overflow`, then writes the entry. A crash
+  between the relink and the entry write (or vice versa) can leak an empty
+  overflow page or drop the inserted entry. No atomicity across the two writes.
+- *Hash hot-bucket degradation (not a crash, a design limit).* Because buckets
+  are fixed, a skewed key distribution piles one bucket into a long overflow
+  chain; that bucket's lookups degrade toward O(n) while others stay O(1). A
+  dynamic hashing scheme would rebalance; static hashing cannot.
+- *Duplicate-key fan-out.* A key with thousands of duplicates spreads RowIds
+  across many leaves (B+ tree) or a long chain (hash); `search` must visit them
+  all. Correct, but a single equality lookup is no longer cheap — a reason real
+  systems sometimes prefer bitmap indexes for low-cardinality columns.
+
 ---
 
 ## 5. Future work / out of scope
