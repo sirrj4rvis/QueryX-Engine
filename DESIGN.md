@@ -436,6 +436,93 @@ mechanism is faithful, the surface is deliberately small.
   `((((...))))` could hit the recursion limit. Real parsers cap nesting depth;
   we do not. Not a concern for hand-written queries.
 
+### Phase 5 — Execution Engine
+
+**Problem solved.** Connect the parser to storage and actually *run* queries.
+This is the first phase where all layers meet: it adds the system catalog, the
+volcano operators, and the `Database` facade that turns a SQL string into rows.
+
+**The volcano (iterator) model.** Every operator implements `open()/next()/
+close()`; operators stack into a tree, and pulling `next()` at the root cascades
+down, so rows flow up one at a time, lazily. Operators built: `SeqScan`,
+`IndexScan`, `Filter`, `Projection`, `Sort`, `Limit`, `Distinct`, and a scalar
+`Aggregate` (COUNT/SUM/AVG/MIN/MAX, no GROUP BY). Most stream; `Sort` and
+`Aggregate` are *blocking* (must consume all input before emitting).
+
+**The catalog (`catalog.py`).** Logical metadata — tables, columns/types, index
+definitions — JSON-backed. The executor uses it to resolve names (catching the
+typos the parser blindly accepts) and to serialize rows by schema.
+
+**The facade (`database.py`).** A database is a directory: a JSON catalog plus
+one pager file per table (`tbl_<name>.qx`) and per index (`idx_<name>.qx`).
+`execute(sql)` dispatches on statement type and, for SELECT, assembles the
+operator tree: `SeqScan → Filter → Sort → Projection → Distinct → Limit` (or
+`SeqScan → Filter → Aggregate`).
+
+**Key decisions and rejected alternatives.**
+
+1. **Volcano/iterator model.** Composable, lazy, constant memory for streaming
+   operators, and the model every textbook and classic engine uses. *Rejected:*
+   materialize-everything (simpler but blows memory) and vectorized/columnar
+   batches (faster for analytics, much more code, and overkill at this scale).
+2. **Sort before Projection.** Sorting the full (pre-projection) rows lets
+   `ORDER BY` reference columns that aren't in the SELECT list — standard SQL
+   behavior. *Rejected:* project-then-sort, which would forbid `ORDER BY` on
+   unselected columns.
+3. **UPDATE = delete + re-insert.** The heap has no in-place update (Phase 2),
+   and a grown row won't fit its slot, so update deletes the old row and inserts
+   a new one, re-pointing indexes. *Consequence:* a row's RowId changes on
+   update — honest and documented.
+4. **A naive planner for now.** Phase 5 always uses `SeqScan`, never an index,
+   even when one exists. Cost-based access-path selection is deliberately
+   deferred to Phase 6; this keeps the execution layer and the optimizer as
+   separate, independently reviewable concerns.
+
+**Complexity / scaling.** A SELECT is dominated by its scan: `SeqScan` is
+O(rows); `Filter/Projection/Limit/Distinct` add O(rows) streaming passes; `Sort`
+is O(rows log rows) and buffers everything; `Aggregate` is O(rows), O(1) state.
+Because the planner never uses an index yet, *every* query — even `WHERE id = 42`
+— is O(rows). That is the exact inefficiency Phase 6 removes.
+
+**PostgreSQL / SQLite comparison.** Both use the iterator model (Postgres's
+`ExecProcNode` pulls tuples through a plan tree; SQLite compiles to a bytecode
+VM that is iterator-like). Both resolve names against a catalog stored in tables.
+We match the shape; we lack their breadth (joins, GROUP BY, subqueries), their
+in-place `UPDATE`, and — crucially — their cost-based planner (next phase).
+
+**Engineering review — flaws, debt, simplifications.**
+
+- *No index usage in the planner.* The biggest current inefficiency, by design;
+  Phase 6's job.
+- *UPDATE churns RowIds and leaves dead space.* Delete+insert fragments pages
+  (no compaction) and rewrites index entries even when the indexed column didn't
+  change. A real engine updates in place when it fits and only touches indexes
+  on changed columns (Postgres's HOT updates).
+- *Eager per-statement flush.* Durable but slow — every mutation flushes the
+  pool. Fine until benchmarking; the WAL (Phase 7) is the real durability story.
+- *No NULLs, no GROUP BY, single table.* Aggregates are scalar-only; mixing an
+  aggregate with a bare column is rejected.
+
+**Failure analysis — concrete scenarios.**
+
+- *Crash mid-UPDATE.* Update deletes the old row, inserts a new one, then fixes
+  indexes — several unsynchronized writes. A crash between the heap insert and
+  the index re-point leaves an index entry pointing at the old (deleted) RowId
+  or missing the new one: a later IndexScan would miss the row or fetch a dead
+  slot. `IndexScan` defensively skips dead slots, but a *stale* entry pointing at
+  a slot since reused by a different row would return the WRONG row. This is the
+  canonical argument for the WAL (Phase 7) and for atomic index maintenance.
+- *Eager flush is not atomic across files.* A table's heap and its index files
+  are separate pagers flushed in sequence; a crash between them leaves heap and
+  index disagreeing. No cross-file atomicity until the WAL.
+- *Type confusion via direct values.* Comparisons rely on Python semantics; an
+  INT column compared to a TEXT literal raises `TypeError` at evaluation rather
+  than being caught at plan time. We type-check INSERT/UPDATE literals, but not
+  every WHERE comparison against the column's declared type.
+- *Sort/aggregate memory.* Both buffer all input rows in Python lists; a SELECT
+  over a table larger than memory would exhaust RAM. Production engines spill to
+  disk (external merge sort); we do not.
+
 ---
 
 ## 5. Future work / out of scope

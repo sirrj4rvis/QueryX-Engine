@@ -8,9 +8,10 @@ built from first principles to expose the internals that production databases
 B+ tree and hash indexing, SQL parsing, volcano-model execution, cost-based
 query optimization, and write-ahead logging with crash recovery.
 
-> **Status:** Phase 4 complete — SQL parser (hand-written lexer +
-> recursive-descent parser → AST, grammar in BNF). Builds on the Phase 2
-> storage engine and Phase 3 indexes. Built one vertical phase at a time; see below.
+> **Status:** Phase 5 complete — execution engine. The volcano (iterator) model
+> runs queries end-to-end: `db.execute("SELECT name FROM users WHERE age >= 25")`
+> returns real rows, through a system catalog and the storage/index layers.
+> Built one vertical phase at a time; see below.
 
 ---
 
@@ -91,7 +92,7 @@ per-phase engineering notes.
   Point lookup: hash ~625x faster than a seq scan. Range scan: B+ tree only —
   a hash index has no ordering. Run: `python benchmarks/index_benchmark.py`
 - [x] **Phase 4** — SQL parser: lexer + recursive-descent parser → AST (grammar in BNF).
-- [ ] **Phase 5** — Execution engine: volcano operators end-to-end.
+- [x] **Phase 5** — Execution engine: volcano operators end-to-end.
 - [ ] **Phase 6** — Cost-based optimizer + `EXPLAIN`.
 - [ ] **Phase 7** — WAL + crash recovery (redo logging + replay).
 - [ ] **Phase 8** — Benchmark suite with matplotlib charts.
@@ -128,8 +129,25 @@ pip install -e ".[test]"
 pytest
 ```
 
-At Phase 1 the suite contains smoke tests proving the skeleton imports and the
-by-layer structure is intact. Each later phase adds tests alongside its code.
+Each phase adds tests alongside its code; the suite currently has 244 passing.
+
+### Usage
+
+```python
+from queryx.database import Database
+
+db = Database("mydb")  # a directory holding the catalog + table/index files
+db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")
+db.execute("INSERT INTO users VALUES (1, 'alice', 30)")
+db.execute("INSERT INTO users VALUES (2, 'bob', 25)")
+
+result = db.execute("SELECT name, age FROM users WHERE age >= 30 ORDER BY name")
+print(result.columns)  # ['name', 'age']
+print(result.rows)     # [('alice', 30)]
+
+db.execute("SELECT COUNT(*), AVG(age) FROM users").rows  # [(2, 27.5)]
+db.close()  # data persists to disk; reopen Database("mydb") to read it back
+```
 
 ---
 
