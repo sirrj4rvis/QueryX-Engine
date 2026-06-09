@@ -97,7 +97,11 @@ def _split_complete(buffer: str) -> tuple[list[str], str]:
 
 
 def _format_table(result: QueryResult, color: bool = False) -> str:
-    """Render a QueryResult as an aligned text table (NULL for None)."""
+    """Render a QueryResult as a boxed, aligned ASCII table (NULL for None).
+
+    ASCII borders only (+ - |), never Unicode box-drawing, so it renders
+    correctly on every console (Windows code pages included).
+    """
     columns = result.columns
     rows = [["NULL" if v is None else str(v) for v in row] for row in result.rows]
     widths = [len(c) for c in columns]
@@ -105,12 +109,17 @@ def _format_table(result: QueryResult, color: bool = False) -> str:
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], len(cell))
 
-    def fmt(cells: list[str]) -> str:
-        return " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+    border = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
 
-    header = _paint(fmt(list(columns)), _C.BOLD + _C.CYAN, color)
-    separator = _paint("-+-".join("-" * w for w in widths), _C.DIM, color)
-    return "\n".join([header, separator] + [fmt(row) for row in rows])
+    def row_line(cells: list[str]) -> str:
+        return "| " + " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells)) + " |"
+
+    dim_border = _paint(border, _C.DIM, color)
+    header = _paint(row_line(list(columns)), _C.BOLD + _C.CYAN, color)
+    lines = [dim_border, header, dim_border]
+    lines += [row_line(row) for row in rows]
+    lines.append(dim_border)
+    return "\n".join(lines)
 
 
 def _run(db: Database, sql: str, out: Callable[..., None], color: bool = False) -> None:

@@ -65,7 +65,8 @@ def test_format_table_aligns_and_shows_null():
     from queryx.database import QueryResult
     table = shell._format_table(QueryResult(columns=["id", "name"], rows=[(1, "alice"), (2, None)]))
     lines = table.splitlines()
-    assert lines[0].startswith("id | name")
+    assert lines[0].startswith("+") and lines[0].endswith("+")  # boxed border
+    assert "| id" in table and "| name" in table                # boxed header row
     assert "NULL" in table
 
 
