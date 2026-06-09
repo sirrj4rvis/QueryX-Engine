@@ -685,6 +685,67 @@ are the deliberate omissions.
   process crash is fully covered; true power-loss durability would require
   per-commit fsync (group commit). Documented, not implemented.
 
+### Phase 8 — Benchmark Suite
+
+**Problem solved.** Turn the project's architectural claims into measured
+numbers. The suite ([benchmarks/benchmark_suite.py](benchmarks/benchmark_suite.py))
+measures insert throughput, point lookup, range scan, and WAL overhead, prints a
+table, writes [benchmarks/REPORT.md](benchmarks/REPORT.md), and renders bar
+charts (degrading to a text-only report if matplotlib is absent).
+
+**What it measures and what each result demonstrates.**
+
+- *Insert:* heap vs B+ tree vs hash — index maintenance cost. The B+ tree is the
+  slowest to build, which directly exposes the Phase 3 simplification
+  (re-serialize the whole node per write).
+- *Point lookup:* SeqScan vs B+ tree vs hash — at N=20,000 a hash lookup is
+  ~300x a sequential scan, making the O(rows) → O(1)/O(log n) jump concrete.
+- *Range scan:* SeqScan vs B+ tree — the B+ tree streams the linked leaves; the
+  hash index is absent because it physically cannot range-scan.
+- *WAL overhead:* raw page writes with logging on vs off — ~2x slower, the
+  measured price of crash durability. Measured at the pager (where the WAL
+  acts), not at the Database level where per-statement catalog writes would
+  swamp the signal — an honest methodology choice.
+
+**Key decisions and rejected alternatives.**
+
+1. **Microbenchmarks with explicit caveats.** Warm pool, single machine, small
+   data, no per-op fsync — labelled as showing *relative* behavior, not
+   production latency. *Rejected:* dressing these up as absolute throughput
+   numbers, which would be misleading.
+2. **matplotlib only for charts, behind a soft import.** The suite still
+   produces a full text/Markdown report without it, preserving the
+   stdlib-only-engine rule (matplotlib is a Phase-8-only visualization dep).
+3. **A tiny smoke test** ([tests/test_benchmarks.py](tests/test_benchmarks.py))
+   asserts the suite runs and the qualitative ordering holds, without asserting
+   machine-specific timings.
+
+**Complexity / scaling.** No new engine algorithms — this phase interprets the
+earlier ones. The numbers confirm the complexity claims: SeqScan point lookup is
+O(rows) (tens of ops/s), index lookups are sub-linear (thousands–tens of
+thousands of ops/s).
+
+**PostgreSQL / SQLite comparison.** Real systems are measured with mature
+harnesses (pgbench, sysbench, SQLite's speedtest) over large data, cold and warm
+caches, concurrency, and durable fsync — capturing effects our microbenchmarks
+deliberately exclude. Ours is a teaching instrument: small, in-process, and
+honest about its limits.
+
+**Failure analysis — what the numbers do NOT capture.**
+
+- *Cold cache / real disk latency.* Everything runs warm in the buffer pool, so
+  these measure CPU + algorithm, not the disk seeks that dominate a real
+  database. On cold data the index advantage would be even larger (fewer pages
+  read), but absolute throughput far lower.
+- *No fsync per operation.* WAL overhead here is log-append + periodic-checkpoint
+  fsync; a power-loss-safe configuration (fsync per commit) would show a much
+  larger WAL tax, normally hidden by group commit.
+- *Run-to-run variance.* Small N and Python timing make results noisy; absolute
+  values shift between runs (the report notes this). Only the order-of-magnitude
+  gaps are meaningful.
+- *No concurrency.* Single-threaded throughput says nothing about contention,
+  lock waits, or buffer-pool thrashing under a real multi-client workload.
+
 ---
 
 ## 5. Future work / out of scope

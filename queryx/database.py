@@ -73,8 +73,9 @@ class QueryResult:
 class Database:
     """Top-level facade: open a database directory and run SQL against it."""
 
-    def __init__(self, directory: str) -> None:
+    def __init__(self, directory: str, use_wal: bool = True) -> None:
         self.directory = directory
+        self._use_wal = use_wal  # disable only for benchmarking WAL overhead
         os.makedirs(directory, exist_ok=True)
         self.catalog = Catalog(os.path.join(directory, "catalog.json"))
         # Open storage objects, lazily created/cached, keyed by logical name.
@@ -138,7 +139,7 @@ class Database:
     def _heap(self, table: str) -> HeapFile:
         if table not in self._tables:
             path = os.path.join(self.directory, f"tbl_{table}.qx")
-            pager = Pager(path)
+            pager = Pager(path, use_wal=self._use_wal)
             self._tables[table] = (pager, HeapFile(BufferPool(pager, capacity=_POOL_CAPACITY)))
         return self._tables[table][1]
 
@@ -146,7 +147,7 @@ class Database:
         if name not in self._indexes:
             info = self.catalog.get_index(name)
             path = os.path.join(self.directory, f"idx_{name}.qx")
-            pager = Pager(path)
+            pager = Pager(path, use_wal=self._use_wal)
             pool = BufferPool(pager, capacity=_POOL_CAPACITY)
             obj = BPlusTree(pool) if info.kind == "btree" else HashIndex(pool)
             self._indexes[name] = (pager, obj)

@@ -8,10 +8,10 @@ built from first principles to expose the internals that production databases
 B+ tree and hash indexing, SQL parsing, volcano-model execution, cost-based
 query optimization, and write-ahead logging with crash recovery.
 
-> **Status:** Phase 7 complete — write-ahead logging + crash recovery. Each page
-> write is logged before it is applied; on restart the log is replayed, so a
-> crash mid-write cannot corrupt or lose committed data. This is what makes
-> QueryX a real database. Built one vertical phase at a time; see below.
+> **Status:** Phase 8 complete — benchmark suite. All core phases done: a working
+> SQL database with page storage, B+ tree/hash indexes, a cost-based optimizer,
+> WAL crash recovery, and a charted benchmark suite. Only the optional Phase 9
+> stretch remains. See the roadmap and benchmarks below.
 
 ---
 
@@ -104,7 +104,7 @@ per-phase engineering notes.
   (chose IndexScan at cost 3.4; SeqScan alternative cost 7.0)
   ```
 - [x] **Phase 7** — WAL + crash recovery (redo logging + replay).
-- [ ] **Phase 8** — Benchmark suite with matplotlib charts.
+- [x] **Phase 8** — Benchmark suite with matplotlib charts.
 - [ ] **Phase 9** — *(optional)* one stretch goal: adaptive indexing **or** one Tier 3 SQL feature.
 
 ---
@@ -125,6 +125,26 @@ optimizer → executor → indexes → storage), never string-matched.
   and `BEGIN/COMMIT/ROLLBACK` transactions.
 
 ---
+
+## Benchmarks
+
+Measured across the three access paths plus WAL overhead. These are in-process
+microbenchmarks (warm buffer pool, single machine, no per-op fsync) — they show
+*relative* algorithmic behavior, not production latencies. Regenerate with
+`python benchmarks/benchmark_suite.py`; full numbers in
+[benchmarks/REPORT.md](benchmarks/REPORT.md).
+
+![benchmark charts](benchmarks/output/benchmarks.png)
+
+Representative results at N = 20,000 rows:
+
+- **Point lookup:** a hash index is ~**300x** faster than a sequential scan; the
+  B+ tree trails hash but is the only index that can range-scan.
+- **Range scan:** B+ tree streams the linked leaves; a hash index cannot do it
+  at all.
+- **Inserts:** the heap and hash index are cheap; the B+ tree is slower to build
+  (it re-serializes a whole node per write — a known, documented simplification).
+- **WAL:** logging makes page writes ~**2x** slower — the price of crash durability.
 
 ## Getting started
 
