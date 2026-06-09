@@ -231,6 +231,10 @@ Projection: name
     -> SeqScan on users  (cost=1.0 rows=0)
 ```
 
+A ready-to-paste tour of every supported feature (incl. multi-row `INSERT`,
+`GROUP BY`, joins, and `EXPLAIN`) lives in
+[examples/sample_queries.sql](examples/sample_queries.sql).
+
 ---
 
 ## Future work / explicitly out of scope

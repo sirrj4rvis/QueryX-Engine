@@ -97,7 +97,8 @@ create_index   ::= "CREATE" "INDEX" ident "ON" ident "(" ident ")"
 drop_index     ::= "DROP" "INDEX" ident
 
 insert         ::= "INSERT" "INTO" ident [ "(" ident { "," ident } ")" ]
-                   "VALUES" "(" value { "," value } ")"
+                   "VALUES" value_tuple { "," value_tuple }
+value_tuple    ::= "(" value { "," value } ")"          (* one or more rows *)
 
 select         ::= "SELECT" [ "DISTINCT" ] select_list
                    "FROM" table_ref [ "JOIN" table_ref "ON" expr ]   (Phase 9b)

@@ -155,7 +155,7 @@ class DropTable(Statement):
 class Insert(Statement):
     table: str
     columns: Optional[list[str]]  # None = positional (all columns, in order)
-    values: list[Expr]
+    rows: list[list[Expr]]        # one or more rows of literal values
 
 
 @dataclass

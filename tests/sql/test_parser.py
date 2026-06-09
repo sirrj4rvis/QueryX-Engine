@@ -49,23 +49,30 @@ def test_insert_positional():
     assert stmt == ast.Insert(
         table="users",
         columns=None,
-        values=[
+        rows=[[
             ast.Literal(1, ColumnType.INT),
             ast.Literal("alice", ColumnType.TEXT),
             ast.Literal(30, ColumnType.INT),
-        ],
+        ]],
     )
 
 
 def test_insert_with_column_list():
     stmt = parse("INSERT INTO users (id, name) VALUES (2, 'bob')")
     assert stmt.columns == ["id", "name"]
-    assert stmt.values == [ast.Literal(2, ColumnType.INT), ast.Literal("bob", ColumnType.TEXT)]
+    assert stmt.rows == [[ast.Literal(2, ColumnType.INT), ast.Literal("bob", ColumnType.TEXT)]]
 
 
 def test_insert_negative_number():
     stmt = parse("INSERT INTO t VALUES (-5)")
-    assert stmt.values == [ast.Literal(-5, ColumnType.INT)]
+    assert stmt.rows == [[ast.Literal(-5, ColumnType.INT)]]
+
+
+def test_insert_multiple_rows():
+    stmt = parse("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+    assert len(stmt.rows) == 3
+    assert stmt.rows[0] == [ast.Literal(1, ColumnType.INT), ast.Literal("a", ColumnType.TEXT)]
+    assert stmt.rows[2] == [ast.Literal(3, ColumnType.INT), ast.Literal("c", ColumnType.TEXT)]
 
 
 # ---------------------------------------------------------------------------

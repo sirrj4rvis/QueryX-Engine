@@ -233,15 +233,18 @@ class Database:
 
     def _insert(self, stmt: ast.Insert) -> int:
         table_info = self.catalog.get_table(stmt.table)
-        values = self._row_values(table_info, stmt)
-        record = serialize_row(table_info.column_types, values)
-        rid = self._heap(stmt.table).insert(record)
-        for info in self.catalog.indexes_for_table(stmt.table):
-            key = values[table_info.position(info.column)]
-            self._index(info.name).insert(key, rid)  # type: ignore[attr-defined]
-        self.catalog.add_row_count(stmt.table, 1)
-        self._flush_table(stmt.table)
-        return 1
+        heap = self._heap(stmt.table)
+        indexes = self.catalog.indexes_for_table(stmt.table)
+        # Resolve and type-check every row first, so a bad row in a multi-row
+        # insert doesn't leave a partially-applied statement.
+        resolved = [self._resolve_row(table_info, stmt.columns, row, stmt.table) for row in stmt.rows]
+        for values in resolved:
+            rid = heap.insert(serialize_row(table_info.column_types, values))
+            for info in indexes:
+                self._index(info.name).insert(values[table_info.position(info.column)], rid)  # type: ignore[attr-defined]
+        self.catalog.add_row_count(stmt.table, len(resolved))
+        self._flush_table(stmt.table)  # flush once for the whole (multi-row) insert
+        return len(resolved)
 
     def _update(self, stmt: ast.Update) -> int:
         table_info = self.catalog.get_table(stmt.table)
@@ -611,26 +614,30 @@ class Database:
         from queryx.execution.operators import evaluate
         return bool(evaluate(expr, row, index_of))
 
-    def _row_values(self, table_info, stmt: ast.Insert) -> list:
-        """Resolve INSERT values into table-column order and type-check them."""
-        if stmt.columns is not None:
-            for c in stmt.columns:
+    def _resolve_row(self, table_info, columns, row_values: list, table: str) -> list:
+        """Resolve one INSERT row into table-column order and type-check it."""
+        if columns is not None:
+            for c in columns:
                 if not table_info.has_column(c):
-                    raise QueryError(f"no such column {c!r} in {stmt.table!r}")
-            if len(stmt.columns) != len(set(stmt.columns)):
+                    raise QueryError(f"no such column {c!r} in {table!r}")
+            if len(columns) != len(set(columns)):
                 raise QueryError("duplicate column in INSERT column list")
-            provided = dict(zip(stmt.columns, stmt.values))
+            if len(columns) != len(row_values):
+                raise QueryError(
+                    f"INSERT lists {len(columns)} columns but {len(row_values)} values"
+                )
+            provided = dict(zip(columns, row_values))
             missing = [c for c in table_info.column_names if c not in provided]
             if missing:
                 raise QueryError(f"missing values for columns {missing} (no defaults/NULL)")
             ordered = [provided[c] for c in table_info.column_names]
         else:
-            if len(stmt.values) != len(table_info.columns):
+            if len(row_values) != len(table_info.columns):
                 raise QueryError(
-                    f"table {stmt.table!r} has {len(table_info.columns)} columns, "
-                    f"got {len(stmt.values)} values"
+                    f"table {table!r} has {len(table_info.columns)} columns, "
+                    f"got {len(row_values)} values"
                 )
-            ordered = stmt.values
+            ordered = row_values
 
         values = []
         for col, literal in zip(table_info.columns, ordered):

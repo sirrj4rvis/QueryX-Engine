@@ -278,12 +278,19 @@ class Parser:
                 columns.append(self._identifier("a column name"))
             self._expect(TokenType.RPAREN, "')' after the column list")
         self._expect(TokenType.VALUES, "VALUES")
-        self._expect(TokenType.LPAREN, "'(' before the value list")
-        values = [self._value()]
+        rows = [self._value_tuple()]
+        while self._match(TokenType.COMMA):
+            rows.append(self._value_tuple())
+        return ast.Insert(table=table, columns=columns, rows=rows)
+
+    def _value_tuple(self) -> list[ast.Expr]:
+        """Parse one parenthesized row of literal values: ``( v1, v2, ... )``."""
+        self._expect(TokenType.LPAREN, "'(' before a value list")
+        values: list[ast.Expr] = [self._value()]
         while self._match(TokenType.COMMA):
             values.append(self._value())
-        self._expect(TokenType.RPAREN, "')' after the value list")
-        return ast.Insert(table=table, columns=columns, values=values)
+        self._expect(TokenType.RPAREN, "')' after a value list")
+        return values
 
     def _value(self) -> ast.Literal:
         """A literal value (number or string), with optional unary minus."""

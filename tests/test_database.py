@@ -62,6 +62,27 @@ def test_insert_count_return(db):
     assert db.execute("INSERT INTO t VALUES (1)") == 1
 
 
+def test_insert_multiple_rows(db):
+    db.execute("CREATE TABLE t (id INT, name TEXT)")
+    n = db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+    assert n == 3  # one statement, three rows
+    assert sorted(db.execute("SELECT * FROM t").rows) == [(1, "a"), (2, "b"), (3, "c")]
+
+
+def test_multi_row_insert_keeps_indexes_in_sync(db):
+    db.execute("CREATE TABLE t (id INT, v INT)")
+    db.execute("CREATE INDEX idx_id ON t (id)")
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+    assert db.execute("SELECT v FROM t WHERE id = 2").rows == [(20,)]
+
+
+def test_multi_row_insert_bad_row_rejected_atomically(db):
+    db.execute("CREATE TABLE t (a INT)")
+    with pytest.raises(QueryError):
+        db.execute("INSERT INTO t VALUES (1), ('oops'), (3)")  # middle row wrong type
+    assert len(db.execute("SELECT * FROM t")) == 0  # nothing inserted
+
+
 # ---------------------------------------------------------------------------
 # WHERE predicates
 # ---------------------------------------------------------------------------
