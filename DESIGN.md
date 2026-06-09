@@ -84,7 +84,10 @@ layering (loosest first): `OR` < `AND` < `NOT` < comparison < primary.
 
 ```bnf
 statement      ::= ( select | insert | update | delete
-                   | create_table | drop_table | create_index | drop_index ) [ ";" ]
+                   | create_table | drop_table | create_index | drop_index
+                   | explain ) [ ";" ]
+
+explain        ::= "EXPLAIN" select
 
 create_table   ::= "CREATE" "TABLE" ident "(" column_def { "," column_def } ")"
 column_def     ::= ident ( "INT" | "INTEGER" | "TEXT" )
@@ -522,6 +525,88 @@ in-place `UPDATE`, and — crucially — their cost-based planner (next phase).
 - *Sort/aggregate memory.* Both buffer all input rows in Python lists; a SELECT
   over a table larger than memory would exhaust RAM. Production engines spill to
   disk (external merge sort); we do not.
+
+### Phase 6 — Cost-Based Optimizer
+
+**Problem solved.** Stop scanning the whole table for selective queries. The
+optimizer estimates the cost of each access path for a WHERE predicate —
+`SeqScan` vs `IndexScan` — and picks the cheaper one. `EXPLAIN <select>` makes
+the decision inspectable.
+
+**The cost model (in page accesses).**
+
+    SeqScan   cost = num_data_pages                  (always reads every page)
+    IndexScan cost = descent + matched_rows          (descend tree, fetch each match)
+       descent  = 1 (hash) or ~log_fanout(rows) (B+ tree)
+       matched  = round(row_count * selectivity)
+
+An IndexScan wins only when `descent + matched < num_data_pages` — i.e. the
+predicate is selective. This is why a low-cardinality equality (or a wide range)
+keeps using a SeqScan, exactly as in real systems.
+
+**Statistics (`statistics.py`).** Two persisted, cheap stats drive estimation:
+`row_count` (maintained on insert/delete) and per-index `n_distinct` (computed
+when the index is built). Selectivity uses the Selinger defaults — equality
+`1/n_distinct` (or 0.1 unknown), range 1/3, `!=` its complement — and composes
+predicates under independence (AND multiplies, OR is inclusion-exclusion, NOT
+complements).
+
+**Access-path selection (`optimizer.py`).** A comparison is *sargable* if it is
+`column <op> literal` (either order; `5 < age` is flipped to `age > 5`) on an
+indexed column, with op compatible with the index kind (hash: `=` only; B+ tree:
+also ranges). Conjuncts of a top-level AND are each candidates; the others become
+a residual Filter. OR/NOT fall back to SeqScan. The optimizer returns an
+`AccessPath` (no storage handles); the Database turns it into operators and
+`explain.py` renders it.
+
+**Key decisions and rejected alternatives.**
+
+1. **Persisted stats, not plan-time scans.** Reading `row_count`/`n_distinct`
+   from the catalog keeps planning O(1). *Rejected:* scanning to gather stats at
+   plan time — which would defeat the purpose (you'd scan to decide whether to
+   scan). The honest cost is staleness after mutations (a real DB re-runs
+   ANALYZE; we don't).
+2. **Single-table, single-index access-path selection only.** No join ordering,
+   no multi-index bitmap-and. *Rejected (out of scope):* a full join enumerator —
+   the classic dynamic-programming Selinger optimizer — which only matters once
+   we have joins (we don't).
+3. **Cost in page accesses, not CPU.** Matches where the real time goes and keeps
+   the model legible. *Rejected:* a calibrated CPU+IO cost (Postgres's
+   `seq_page_cost`/`cpu_tuple_cost`) — more accurate, more knobs, less clear.
+4. **Residual Filter re-checks the full predicate** after an index scan unless
+   the index lookup exactly equals the whole WHERE. Simple and always correct.
+
+**Complexity / scaling.** Planning is O(size of the predicate) — a constant for
+real queries. The payoff: a selective point query drops from O(pages) to
+O(descent + matches). Where it stops: without histograms, estimates on skewed or
+correlated columns are wrong (the independence assumption), so the optimizer can
+mis-cost and pick the worse plan — a real and well-known failure mode.
+
+**PostgreSQL / SQLite comparison.** Both are cost-based with far richer
+statistics: histograms, most-common-value lists, n_distinct, and correlation,
+refreshed by ANALYZE; Postgres calibrates CPU vs IO costs and enumerates join
+orders by dynamic programming. We implement the core idea — estimate cost from
+selectivity, compare access paths, expose it via EXPLAIN — on a single table with
+magic-number selectivities. The mechanism is faithful; the statistics are
+deliberately thin.
+
+**Failure analysis — concrete scenarios.**
+
+- *Stale statistics.* `n_distinct` is frozen at index-build time and `row_count`
+  drifts only by +/-; after a bulk insert that changes a column's distribution,
+  the optimizer estimates against the old shape and can choose a now-bad plan.
+  Postgres mitigates with autovacuum/ANALYZE; QueryX would need a manual
+  re-create. Crucially this is a *performance* bug, never a *correctness* one —
+  the chosen plan still returns the right rows.
+- *Independence assumption on correlated columns.* `WHERE city = 'NYC' AND state
+  = 'NY'` multiplies selectivities as if independent, badly underestimating
+  matches when the columns are correlated, leading to an over-eager IndexScan.
+- *Uniform-distribution range estimate.* Every range is assumed 1/3 selective; a
+  query like `age > 200` on human ages (matches ~0 rows) is wildly overestimated,
+  so the optimizer may skip an index that would have been ideal.
+- *Magic-constant equality without an index.* A predicate on an unindexed column
+  uses 0.1 with no way to know better; combined ANDs can compound the error.
+  Only an index (with its n_distinct) sharpens the estimate.
 
 ---
 

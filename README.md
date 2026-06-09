@@ -8,10 +8,10 @@ built from first principles to expose the internals that production databases
 B+ tree and hash indexing, SQL parsing, volcano-model execution, cost-based
 query optimization, and write-ahead logging with crash recovery.
 
-> **Status:** Phase 5 complete — execution engine. The volcano (iterator) model
-> runs queries end-to-end: `db.execute("SELECT name FROM users WHERE age >= 25")`
-> returns real rows, through a system catalog and the storage/index layers.
-> Built one vertical phase at a time; see below.
+> **Status:** Phase 6 complete — cost-based optimizer. The planner estimates
+> `SeqScan` vs `IndexScan` cost from table statistics and picks the cheaper path;
+> `EXPLAIN <query>` shows the chosen plan and its cost. Built on the Phase 5
+> execution engine. Built one vertical phase at a time; see below.
 
 ---
 
@@ -93,7 +93,16 @@ per-phase engineering notes.
   a hash index has no ordering. Run: `python benchmarks/index_benchmark.py`
 - [x] **Phase 4** — SQL parser: lexer + recursive-descent parser → AST (grammar in BNF).
 - [x] **Phase 5** — Execution engine: volcano operators end-to-end.
-- [ ] **Phase 6** — Cost-based optimizer + `EXPLAIN`.
+- [x] **Phase 6** — Cost-based optimizer + `EXPLAIN`.
+
+  ```
+  EXPLAIN SELECT name FROM users WHERE id = 500 ORDER BY name LIMIT 3
+  Limit: 3
+    -> Projection: name
+      -> Sort: name
+        -> IndexScan using idx_id (btree) on users [id = 500]  (cost=3.4 rows=1)
+  (chose IndexScan at cost 3.4; SeqScan alternative cost 7.0)
+  ```
 - [ ] **Phase 7** — WAL + crash recovery (redo logging + replay).
 - [ ] **Phase 8** — Benchmark suite with matplotlib charts.
 - [ ] **Phase 9** — *(optional)* one stretch goal: adaptive indexing **or** one Tier 3 SQL feature.

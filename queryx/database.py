@@ -35,12 +35,16 @@ from dataclasses import dataclass
 
 from queryx.catalog import Catalog, CatalogError, ColumnInfo
 from queryx.execution.operators import (
-    Aggregate, Distinct, Filter, Limit, Operator, Projection, SeqScan, Sort,
+    Aggregate, Distinct, Filter, IndexScan, Limit, Operator, Projection, SeqScan, Sort,
 )
 from queryx.index.btree import BPlusTree
 from queryx.index.hash_index import HashIndex
+from queryx.planner.explain import format_plan
+from queryx.planner.optimizer import AccessPath, choose_access_path
+from queryx.planner.statistics import TableStats
 from queryx.sql import ast
 from queryx.sql.parser import parse
+from queryx.sql.tokens import TokenType
 from queryx.storage.buffer_pool import BufferPool
 from queryx.storage.heap_file import HeapFile, RowId
 from queryx.storage.page import ColumnType, deserialize_row, serialize_row
@@ -98,6 +102,8 @@ class Database:
             return self._update(stmt)
         if isinstance(stmt, ast.Delete):
             return self._delete(stmt)
+        if isinstance(stmt, ast.Explain):
+            return self._explain(stmt.query)
         raise QueryError(f"unsupported statement type {type(stmt).__name__}")
 
     def close(self) -> None:
@@ -172,10 +178,14 @@ class Database:
         heap = self._heap(stmt.table)
         types = table_info.column_types
         pos = table_info.position(stmt.column)
+        distinct_keys: set = set()
         for rid, record in heap.scan():
             key = deserialize_row(types, record)[pos]
             index.insert(key, rid)  # type: ignore[attr-defined]
+            distinct_keys.add(key)
         index.flush()  # type: ignore[attr-defined]
+        # Record the column statistic the optimizer uses for equality selectivity.
+        self.catalog.set_index_stats(stmt.name, len(distinct_keys))
         return None
 
     def _drop_index(self, stmt: ast.DropIndex) -> None:
@@ -193,6 +203,7 @@ class Database:
         for info in self.catalog.indexes_for_table(stmt.table):
             key = values[table_info.position(info.column)]
             self._index(info.name).insert(key, rid)  # type: ignore[attr-defined]
+        self.catalog.add_row_count(stmt.table, 1)
         self._flush_table(stmt.table)
         return 1
 
@@ -252,6 +263,7 @@ class Database:
             heap.delete(rid)
             for info in indexes:
                 self._index(info.name).delete(row[table_info.position(info.column)], rid)  # type: ignore[attr-defined]
+        self.catalog.add_row_count(stmt.table, -len(matches))
         self._flush_table(stmt.table)
         return len(matches)
 
@@ -271,9 +283,8 @@ class Database:
         aggregates = [p for p in stmt.projections if isinstance(p, ast.Aggregate)]
         stars = [p for p in stmt.projections if isinstance(p, ast.Star)]
 
-        root: Operator = SeqScan(self._heap(stmt.table), names, types)
-        if stmt.where is not None:
-            root = Filter(root, stmt.where)
+        # Cost-based access-path selection (SeqScan vs IndexScan + residual).
+        root: Operator = self._build_scan(table_info, stmt.table, stmt.where)
 
         if aggregates:
             if len(aggregates) != len(stmt.projections):
@@ -304,6 +315,63 @@ class Database:
             root = Limit(root, stmt.limit)
 
         return QueryResult(columns=list(root.column_names), rows=list(root))
+
+    # -- planning helpers ---------------------------------------------------
+
+    def _table_stats(self, table: str) -> TableStats:
+        table_info = self.catalog.get_table(table)
+        self._heap(table)  # ensure the pager is open
+        pager = self._tables[table][0]
+        return TableStats(row_count=table_info.row_count, num_data_pages=max(0, pager.num_pages - 1))
+
+    def _access_path(self, table_info, where) -> AccessPath:
+        indexes = self.catalog.indexes_for_table(table_info.name)
+        n_distinct = {i.column: i.n_distinct for i in indexes if i.n_distinct is not None}
+        return choose_access_path(where, self._table_stats(table_info.name), indexes, n_distinct)
+
+    def _build_scan(self, table_info, table: str, where) -> Operator:
+        """Build the scan (+ residual Filter) the optimizer chose."""
+        heap = self._heap(table)
+        names, types = table_info.column_names, table_info.column_types
+        ap = self._access_path(table_info, where)
+        if ap.method == "IndexScan":
+            index = self._index(ap.index_name)
+            root: Operator = IndexScan(heap, self._rowids_for(index, ap), names, types)
+            if ap.residual is not None:
+                root = Filter(root, ap.residual)
+            return root
+        root = SeqScan(heap, names, types)
+        if where is not None:
+            root = Filter(root, where)
+        return root
+
+    def _rowids_for(self, index, ap: AccessPath) -> list:
+        """Produce the RowIds for an IndexScan from the chosen access path.
+
+        Index keys are integers, so exclusive range bounds are exact via +/-1.
+        """
+        op, value = ap.op, ap.value
+        if op == TokenType.EQ:
+            return index.search(value)
+        if op == TokenType.GT:
+            return [rid for _k, rid in index.range_scan(low=value + 1)]
+        if op == TokenType.GTE:
+            return [rid for _k, rid in index.range_scan(low=value)]
+        if op == TokenType.LT:
+            return [rid for _k, rid in index.range_scan(high=value - 1)]
+        if op == TokenType.LTE:
+            return [rid for _k, rid in index.range_scan(high=value)]
+        raise QueryError(f"unsupported index operator {op}")  # pragma: no cover
+
+    def _explain(self, select: ast.Select) -> str:
+        table_info = self.catalog.get_table(select.table)
+        referenced = set(self._columns_in(select.where)) if select.where else set()
+        if select.order_by:
+            referenced.update(o.column for o in select.order_by)
+        self._validate_columns(table_info, referenced)
+        indexes = self.catalog.indexes_for_table(select.table)
+        n_distinct = {i.column: i.n_distinct for i in indexes if i.n_distinct is not None}
+        return format_plan(select, table_info, self._table_stats(select.table), indexes, n_distinct)
 
     # -- helpers ------------------------------------------------------------
 

@@ -177,3 +177,9 @@ class CreateIndex(Statement):
 @dataclass
 class DropIndex(Statement):
     name: str
+
+
+@dataclass
+class Explain(Statement):
+    """EXPLAIN <select>: describe the plan instead of running it."""
+    query: Select

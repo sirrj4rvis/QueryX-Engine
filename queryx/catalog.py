@@ -41,9 +41,14 @@ class ColumnInfo:
 
 @dataclass
 class TableInfo:
-    """A table's logical schema: its name and ordered columns."""
+    """A table's logical schema: its name, ordered columns, and a row count.
+
+    ``row_count`` is a maintained statistic (updated on insert/delete), read by
+    the optimizer to estimate result sizes without scanning at plan time.
+    """
     name: str
     columns: list[ColumnInfo]
+    row_count: int = 0
 
     @property
     def column_names(self) -> list[str]:
@@ -66,11 +71,18 @@ class TableInfo:
 
 @dataclass
 class IndexInfo:
-    """An index definition: its name, the table/column it covers, and its kind."""
+    """An index definition plus a cached column statistic.
+
+    ``n_distinct`` is the number of distinct key values, computed when the index
+    is built (we already scan every row to populate it) and used by the optimizer
+    for equality selectivity (1/n_distinct). It goes STALE after later
+    inserts/updates — a real database refreshes it via ANALYZE; QueryX does not.
+    """
     name: str
     table: str
     column: str
     kind: str  # "btree" or "hash"
+    n_distinct: int | None = None
 
 
 class Catalog:
@@ -121,6 +133,12 @@ class Catalog:
     def list_tables(self) -> list[str]:
         return sorted(self._tables)
 
+    def add_row_count(self, table: str, delta: int) -> None:
+        """Adjust a table's maintained row count (e.g. +1 on insert, -n on delete)."""
+        info = self.get_table(table)
+        info.row_count = max(0, info.row_count + delta)
+        self._save()
+
     # -- indexes ------------------------------------------------------------
 
     def create_index(self, name: str, table: str, column: str, kind: str = "btree") -> IndexInfo:
@@ -151,6 +169,11 @@ class Catalog:
         del self._indexes[name]
         self._save()
 
+    def set_index_stats(self, name: str, n_distinct: int) -> None:
+        """Record the distinct-key count for an index (computed when it is built)."""
+        self.get_index(name).n_distinct = n_distinct
+        self._save()
+
     def indexes_for_table(self, table: str) -> list[IndexInfo]:
         return [i for i in self._indexes.values() if i.table == table]
 
@@ -169,11 +192,14 @@ class Catalog:
     def _save(self) -> None:
         data = {
             "tables": {
-                name: {"columns": [[c.name, c.type.name] for c in info.columns]}
+                name: {
+                    "columns": [[c.name, c.type.name] for c in info.columns],
+                    "row_count": info.row_count,
+                }
                 for name, info in self._tables.items()
             },
             "indexes": {
-                name: {"table": i.table, "column": i.column, "kind": i.kind}
+                name: {"table": i.table, "column": i.column, "kind": i.kind, "n_distinct": i.n_distinct}
                 for name, i in self._indexes.items()
             },
         }
@@ -185,6 +211,9 @@ class Catalog:
             data = json.load(f)
         for name, t in data.get("tables", {}).items():
             columns = [ColumnInfo(col_name, ColumnType[type_name]) for col_name, type_name in t["columns"]]
-            self._tables[name] = TableInfo(name=name, columns=columns)
+            self._tables[name] = TableInfo(name=name, columns=columns, row_count=t.get("row_count", 0))
         for name, i in data.get("indexes", {}).items():
-            self._indexes[name] = IndexInfo(name=name, table=i["table"], column=i["column"], kind=i["kind"])
+            self._indexes[name] = IndexInfo(
+                name=name, table=i["table"], column=i["column"], kind=i["kind"],
+                n_distinct=i.get("n_distinct"),
+            )

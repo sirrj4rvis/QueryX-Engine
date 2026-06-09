@@ -102,6 +102,9 @@ class Parser:
             return self._update()
         if type_ == TokenType.DELETE:
             return self._delete()
+        if type_ == TokenType.EXPLAIN:
+            self._advance()
+            return ast.Explain(self._select())  # EXPLAIN applies to a SELECT
         raise self._error("expected a statement (SELECT/INSERT/UPDATE/DELETE/CREATE/DROP)")
 
     # -- SELECT -------------------------------------------------------------

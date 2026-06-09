@@ -60,6 +60,7 @@ class TokenType(Enum):
     DELETE = auto()
     INDEX = auto()
     ON = auto()
+    EXPLAIN = auto()
     AND = auto()
     OR = auto()
     NOT = auto()
@@ -101,6 +102,7 @@ KEYWORDS: dict[str, TokenType] = {
     "DELETE": TokenType.DELETE,
     "INDEX": TokenType.INDEX,
     "ON": TokenType.ON,
+    "EXPLAIN": TokenType.EXPLAIN,
     "AND": TokenType.AND,
     "OR": TokenType.OR,
     "NOT": TokenType.NOT,
