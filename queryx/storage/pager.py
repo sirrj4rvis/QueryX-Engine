@@ -202,6 +202,11 @@ class Pager:
     def free_page_count(self) -> int:
         return len(self._free_list)
 
+    @property
+    def wal_bytes(self) -> int:
+        """Size of the write-ahead log in bytes (0 if WAL is disabled)."""
+        return self._wal.size() if self._wal is not None else 0
+
     # -- durability / lifecycle --------------------------------------------
 
     def sync(self) -> None:

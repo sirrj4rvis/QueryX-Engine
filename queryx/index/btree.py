@@ -353,6 +353,11 @@ class BPlusTree:
     # -- introspection / lifecycle -----------------------------------------
 
     @property
+    def pool(self) -> BufferPool:
+        """The buffer pool backing this index (read-only, for introspection)."""
+        return self._pool
+
+    @property
     def root_page(self) -> int:
         return self._root
 

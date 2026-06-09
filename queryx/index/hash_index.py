@@ -172,6 +172,11 @@ class HashIndex:
     # -- introspection / lifecycle -----------------------------------------
 
     @property
+    def pool(self) -> BufferPool:
+        """The buffer pool backing this index (read-only, for introspection)."""
+        return self._pool
+
+    @property
     def num_buckets(self) -> int:
         return self._num_buckets
 

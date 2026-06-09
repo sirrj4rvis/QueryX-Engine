@@ -50,7 +50,7 @@ from queryx.sql.parser import parse
 from queryx.sql.tokens import TokenType
 from queryx.storage.buffer_pool import BufferPool
 from queryx.storage.heap_file import HeapFile, RowId
-from queryx.storage.page import ColumnType, deserialize_row, serialize_row
+from queryx.storage.page import PAGE_SIZE, ColumnType, deserialize_row, serialize_row
 from queryx.storage.pager import Pager
 
 _POOL_CAPACITY = 64
@@ -122,6 +122,57 @@ class Database:
             pager.close()
         self._tables.clear()
         self._indexes.clear()
+
+    # -- introspection (for the shell's .stats / .pages and demos) ----------
+
+    def runtime_stats(self) -> dict:
+        """Aggregate buffer-pool and storage statistics across all open files.
+
+        Exposes the normally-hidden internals (cache hit ratio, page counts, WAL
+        size) so they can be shown live — the 'miniature Postgres' view.
+        """
+        table_entries = list(self._tables.values())
+        index_entries = list(self._indexes.values())
+        pools = [heap.pool for _pager, heap in table_entries]
+        pools += [obj.pool for _pager, obj in index_entries]  # type: ignore[attr-defined]
+
+        hits = sum(p.hits for p in pools)
+        misses = sum(p.misses for p in pools)
+        total = hits + misses
+        return {
+            "open_tables": len(table_entries),
+            "open_indexes": len(index_entries),
+            "data_pages": sum(pager.num_pages - 1 for pager, _ in table_entries),
+            "index_pages": sum(pager.num_pages - 1 for pager, _ in index_entries),
+            "buffer_cached_pages": sum(p.size for p in pools),
+            "buffer_dirty_pages": sum(p.dirty_count for p in pools),
+            "buffer_hits": hits,
+            "buffer_misses": misses,
+            "buffer_hit_ratio": (hits / total) if total else 0.0,
+            "wal_bytes": sum(pager.wal_bytes for pager, _ in table_entries + index_entries),
+        }
+
+    def page_layout(self, table: str) -> list[dict]:
+        """Per-page storage layout of a table's heap (on-disk view).
+
+        Shows how rows are packed into 4KB pages: slot count, live rows, free
+        bytes, and how full each page is.
+        """
+        self._heap(table)  # ensure the table's file is open
+        pager, _heap = self._tables[table]
+        layout = []
+        for page_no in range(1, pager.num_pages):
+            page = pager.read_page(page_no)
+            live = sum(1 for _ in page.records())
+            free = page.free_space()
+            layout.append({
+                "page": page_no,
+                "slots": page.num_slots,
+                "live": live,
+                "free": free,
+                "used_pct": 100.0 * (PAGE_SIZE - free) / PAGE_SIZE,
+            })
+        return layout
 
     def simulate_crash(self) -> None:
         """Test/demo: abandon all open files WITHOUT checkpointing, leaving each

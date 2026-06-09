@@ -144,6 +144,38 @@ def test_meta_quit_stops_processing(tmp_path):
     assert "(0 rows)" not in out
 
 
+def test_timing_suffix_is_shown(tmp_path):
+    out = drive(tmp_path, ["CREATE TABLE t (id INT);", "SELECT * FROM t;"])
+    assert "ms]" in out  # per-query timing
+
+
+def test_meta_stats_shows_internals(tmp_path):
+    out = drive(tmp_path, [
+        "CREATE TABLE t (id INT);",
+        "INSERT INTO t VALUES (1), (2), (3);",
+        "SELECT * FROM t;",
+        ".stats",
+    ])
+    assert "buffer pool" in out
+    assert "hit ratio" in out
+    assert "data pages" in out
+
+
+def test_meta_pages_shows_layout(tmp_path):
+    out = drive(tmp_path, [
+        "CREATE TABLE t (id INT, name TEXT);",
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b');",
+        ".pages t",
+    ])
+    assert "data page" in out
+    assert "page | slots | live" in out
+
+
+def test_meta_pages_requires_table(tmp_path):
+    out = drive(tmp_path, [".pages"])
+    assert "usage: .pages" in out
+
+
 def test_recommend_and_apply(tmp_path):
     # advisor default threshold is 5; issue enough equality queries to trigger it
     lines = ["CREATE TABLE t (id INT, v INT);"]

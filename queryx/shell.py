@@ -4,27 +4,50 @@ Run:
     python -m queryx [DB_DIR]
 
 Type SQL terminated by ';' (statements may span multiple lines). Results print
-as a formatted table; INSERT/UPDATE/DELETE report affected rows; EXPLAIN prints
-the plan. Lines starting with '.' are meta-commands (see .help). Ctrl-D (EOF) or
-.quit exits, flushing and checkpointing the database on the way out.
+as a formatted table with a per-query timing; INSERT/UPDATE/DELETE report
+affected rows; EXPLAIN prints the plan. Lines starting with '.' are
+meta-commands (see .help) — including .stats and .pages, which expose the
+engine's internals (buffer-pool hit ratio, on-disk page layout). Ctrl-D (EOF)
+or .quit exits, flushing and checkpointing the database on the way out.
 
-The core loop is factored as repl(db, read_line, out) so it can be driven by a
-real terminal (main) or by test streams.
+The core loop is factored as repl(db, read_line, out, color) so it can be driven
+by a real terminal (main) or by test streams. Colour is emitted only on a TTY
+(disabled under tests and when NO_COLOR is set), so captured output stays plain.
 """
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 from typing import Callable
 
+from queryx import __version__
 from queryx.catalog import CatalogError
 from queryx.database import Database, QueryError, QueryResult
 from queryx.sql.tokens import SQLSyntaxError
 
+
+class _C:
+    """ANSI colour codes (stdlib only — no third-party dependency)."""
+    RESET = "\x1b[0m"
+    BOLD = "\x1b[1m"
+    DIM = "\x1b[2m"
+    RED = "\x1b[31m"
+    GREEN = "\x1b[32m"
+    YELLOW = "\x1b[33m"
+    CYAN = "\x1b[36m"
+
+
+def _paint(text: str, code: str, color: bool) -> str:
+    return f"{code}{text}{_C.RESET}" if color else text
+
+
 BANNER = (
-    "QueryX interactive shell.\n"
-    "Enter SQL terminated by ';'. Meta-commands start with '.' (try .help). "
-    ".quit to exit."
+    "=" * 60 + "\n"
+    f"  QueryX {__version__}  -  a relational database engine, from scratch\n"
+    + "=" * 60 + "\n"
+    "Type SQL ending with ';'.  .help for commands,  .quit to exit."
 )
 
 HELP = """Meta-commands:
@@ -32,16 +55,18 @@ HELP = """Meta-commands:
   .tables            list tables
   .indexes           list indexes
   .schema [table]    show columns (all tables, or one) and row counts
-  .recommend         show indexes the workload advisor suggests
+  .stats             buffer-pool hit ratio, page counts, WAL size
+  .pages <table>     on-disk page layout (slots, live rows, fill %)
+  .recommend         indexes the workload advisor suggests
   .apply             create the recommended indexes
   .quit / .exit      leave the shell
 
 SQL examples:
   CREATE TABLE users (id INT, name TEXT, age INT);
-  INSERT INTO users VALUES (1, 'alice', 30);
+  INSERT INTO users VALUES (1, 'alice', 30), (2, 'bob', 25);
   SELECT name FROM users WHERE age >= 30 ORDER BY name;
   SELECT age, COUNT(*) FROM users GROUP BY age HAVING COUNT(*) > 1;
-  CREATE INDEX idx_id ON users (id);
+  SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id;
   EXPLAIN SELECT name FROM users WHERE id = 1;"""
 
 
@@ -71,7 +96,7 @@ def _split_complete(buffer: str) -> tuple[list[str], str]:
     return statements, buffer[start:]
 
 
-def _format_table(result: QueryResult) -> str:
+def _format_table(result: QueryResult, color: bool = False) -> str:
     """Render a QueryResult as an aligned text table (NULL for None)."""
     columns = result.columns
     rows = [["NULL" if v is None else str(v) for v in row] for row in result.rows]
@@ -83,35 +108,62 @@ def _format_table(result: QueryResult) -> str:
     def fmt(cells: list[str]) -> str:
         return " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
 
-    lines = [fmt(list(columns)), "-+-".join("-" * w for w in widths)]
-    lines += [fmt(row) for row in rows]
-    return "\n".join(lines)
+    header = _paint(fmt(list(columns)), _C.BOLD + _C.CYAN, color)
+    separator = _paint("-+-".join("-" * w for w in widths), _C.DIM, color)
+    return "\n".join([header, separator] + [fmt(row) for row in rows])
 
 
-def _run(db: Database, sql: str, out: Callable[..., None]) -> None:
-    """Execute one statement and print its result, catching query errors."""
+def _run(db: Database, sql: str, out: Callable[..., None], color: bool = False) -> None:
+    """Execute one statement, time it, and print the result; never crashes."""
+    start = time.perf_counter()
     try:
         result = db.execute(sql)
     except (SQLSyntaxError, CatalogError, QueryError) as exc:
-        out(f"Error: {exc}")
+        out(_paint(f"Error: {exc}", _C.RED, color))
         return
-    except Exception as exc:  # never let the shell crash on a bad query
-        out(f"Error: {type(exc).__name__}: {exc}")
+    except Exception as exc:  # never let the shell die on a bad query
+        out(_paint(f"Error: {type(exc).__name__}: {exc}", _C.RED, color))
         return
+    timing = _paint(f"[{(time.perf_counter() - start) * 1000:.2f} ms]", _C.DIM, color)
 
     if isinstance(result, QueryResult):
-        out(_format_table(result))
+        out(_format_table(result, color))
         n = len(result.rows)
-        out(f"({n} row{'' if n == 1 else 's'})")
+        out(f"({n} row{'' if n == 1 else 's'}) {timing}")
     elif isinstance(result, str):  # EXPLAIN
         out(result)
+        out(timing)
     elif isinstance(result, int):  # INSERT / UPDATE / DELETE
-        out(f"{result} row{'' if result == 1 else 's'} affected")
+        out(f"{result} row{'' if result == 1 else 's'} affected {timing}")
     else:  # DDL returns None
-        out("OK")
+        out(f"{_paint('OK', _C.GREEN, color)} {timing}")
 
 
-def _meta(db: Database, line: str, out: Callable[..., None]) -> bool:
+def _meta_stats(db: Database, out: Callable[..., None], color: bool) -> None:
+    s = db.runtime_stats()
+    out(_paint("buffer pool", _C.BOLD, color))
+    out(f"  hit ratio    : {s['buffer_hit_ratio'] * 100:5.1f}%   "
+        f"({s['buffer_hits']} hits / {s['buffer_misses']} misses)")
+    out(f"  cached pages : {s['buffer_cached_pages']}    dirty: {s['buffer_dirty_pages']}")
+    out(_paint("storage", _C.BOLD, color))
+    out(f"  data pages   : {s['data_pages']}    index pages: {s['index_pages']}")
+    out(f"  WAL bytes    : {s['wal_bytes']}")
+    out(f"  open tables  : {s['open_tables']}    open indexes: {s['open_indexes']}")
+
+
+def _meta_pages(db: Database, table: str, out: Callable[..., None], color: bool) -> None:
+    try:
+        layout = db.page_layout(table)
+    except CatalogError as exc:
+        out(_paint(f"Error: {exc}", _C.RED, color))
+        return
+    out(f"{table}: {len(layout)} data page(s)  (page 0 is the file header)")
+    out(_paint("page | slots | live | free B | used", _C.BOLD, color))
+    for p in layout:
+        out(f"{p['page']:>4} | {p['slots']:>5} | {p['live']:>4} | {p['free']:>6} | {p['used_pct']:>3.0f}%")
+
+
+def _meta(db: Database, line: str, out: Callable[..., None], color: bool = False) -> bool:
     """Handle a '.' meta-command. Return False to quit the shell."""
     parts = line[1:].split()
     cmd = parts[0].lower() if parts else ""
@@ -138,10 +190,17 @@ def _meta(db: Database, line: str, out: Callable[..., None]) -> bool:
             try:
                 info = db.catalog.get_table(table)
             except CatalogError as exc:
-                out(f"Error: {exc}")
+                out(_paint(f"Error: {exc}", _C.RED, color))
                 continue
             cols = ", ".join(f"{c.name} {c.type.name}" for c in info.columns)
             out(f"{table} ({cols})  [{info.row_count} rows]")
+    elif cmd == "stats":
+        _meta_stats(db, out, color)
+    elif cmd == "pages":
+        if len(parts) < 2:
+            out("usage: .pages <table>")
+        else:
+            _meta_pages(db, parts[1], out, color)
     elif cmd == "recommend":
         recs = db.recommend_indexes()
         if not recs:
@@ -156,7 +215,8 @@ def _meta(db: Database, line: str, out: Callable[..., None]) -> bool:
     return True
 
 
-def repl(db: Database, read_line: Callable[[str], "str | None"], out: Callable[..., None]) -> None:
+def repl(db: Database, read_line: Callable[[str], "str | None"],
+         out: Callable[..., None], color: bool = False) -> None:
     """Run the read-eval-print loop. ``read_line(prompt)`` returns a line, or
     None at end of input; ``out(text='')`` prints a line of output."""
     out(BANNER)
@@ -168,19 +228,20 @@ def repl(db: Database, read_line: Callable[[str], "str | None"], out: Callable[.
             out("")
             return
         if not buffer.strip() and line.strip().startswith("."):
-            if not _meta(db, line.strip(), out):
+            if not _meta(db, line.strip(), out, color):
                 return
             continue
         buffer += line + "\n"
         statements, buffer = _split_complete(buffer)
         for statement in statements:
             if statement.strip():
-                _run(db, statement, out)
+                _run(db, statement, out, color)
 
 
 def main(argv: "list[str] | None" = None) -> None:
     args = sys.argv[1:] if argv is None else argv
     db_dir = args[0] if args else "queryx_data"
+    color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
     db = Database(db_dir)
     print(f"Connected to {db_dir!r}.")
 
@@ -191,7 +252,7 @@ def main(argv: "list[str] | None" = None) -> None:
             return None
 
     try:
-        repl(db, read_line, lambda text="": print(text))
+        repl(db, read_line, lambda text="": print(text), color=color)
     except KeyboardInterrupt:
         print("\n(interrupted)")
     finally:

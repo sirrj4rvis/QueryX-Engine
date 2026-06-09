@@ -73,6 +73,11 @@ class HeapFile:
         num_pages = pool.pager.num_pages
         self._last_page: int | None = (num_pages - 1) if num_pages > 1 else None
 
+    @property
+    def pool(self) -> BufferPool:
+        """The buffer pool backing this heap (read-only, for introspection)."""
+        return self._pool
+
     # -- writes -------------------------------------------------------------
 
     def insert(self, record: bytes) -> RowId:
