@@ -103,4 +103,4 @@ A clean GitHub repo with: the engine, B+ tree + hash index, SQL parser with docu
 
 ## Current status
 
-Status: Engine complete and frozen — all phases built and working. Now in showcase/polish mode. See SHOWCASE.md for current work.
+Status: Engine complete and frozen; showcase/polish phase complete.
