@@ -374,6 +374,39 @@ class BPlusTree:
             node = self._load(node.children[0])
         return levels
 
+    def node_levels(self) -> list[list[dict]]:
+        """Read-only snapshot of the tree's nodes, level by level (root first).
+
+        Walks the tree using the existing node-loading path and returns plain
+        dictionaries describing each node's CURRENT contents:
+            internal -> {"page", "leaf": False, "keys", "children"}
+            leaf     -> {"page", "leaf": True,  "keys", "next_leaf"}
+        It performs no writes and stores no new state — inspection only (used by
+        the shell's read-only `.tree` command). Reads go through the buffer pool
+        exactly like a query, so the only side effect is on read counters.
+        """
+        result: list[list[dict]] = []
+        current = [self._root]
+        while current:
+            level: list[dict] = []
+            next_level: list[int] = []
+            for page_no in current:
+                node = self._load(page_no)
+                if node.is_leaf:
+                    level.append({
+                        "page": node.page_no, "leaf": True,
+                        "keys": list(node.keys), "next_leaf": node.next_leaf,
+                    })
+                else:
+                    level.append({
+                        "page": node.page_no, "leaf": False,
+                        "keys": list(node.keys), "children": list(node.children),
+                    })
+                    next_level.extend(node.children)
+            result.append(level)
+            current = next_level
+        return result
+
     def flush(self) -> None:
         """Persist all buffered node/meta changes through the pager."""
         self._pool.flush_all()

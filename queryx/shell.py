@@ -57,6 +57,7 @@ HELP = """Meta-commands:
   .schema [table]    show columns (all tables, or one) and row counts
   .stats             buffer-pool hit ratio, page counts, WAL size
   .pages <table>     on-disk page layout (slots, live rows, fill %)
+  .tree <index>      print a B+ tree index as static ASCII (nodes, keys, leaves)
   .recommend         indexes the workload advisor suggests
   .apply             create the recommended indexes
   .quit / .exit      leave the shell
@@ -172,6 +173,43 @@ def _meta_pages(db: Database, table: str, out: Callable[..., None], color: bool)
         out(f"{p['page']:>4} | {p['slots']:>5} | {p['live']:>4} | {p['free']:>6} | {p['used_pct']:>3.0f}%")
 
 
+def _fmt_keys(keys: list, limit: int = 8) -> str:
+    """Render a node's key list, truncating very wide nodes for readability."""
+    if len(keys) <= limit:
+        return "[" + ", ".join(str(k) for k in keys) + "]"
+    head = ", ".join(str(k) for k in keys[:limit])
+    return f"[{head}, ... (+{len(keys) - limit} more)]"
+
+
+def _meta_tree(db: Database, name: str, out: Callable[..., None], color: bool) -> None:
+    """Print a B+ tree index as static ASCII (read-only)."""
+    try:
+        snap = db.index_structure(name)
+    except (CatalogError, QueryError) as exc:
+        out(_paint(f"Error: {exc}", _C.RED, color))
+        return
+    out(_paint(f"B+ tree {name!r}  (height {snap['height']}, max_keys {snap['max_keys']})",
+               _C.BOLD, color))
+    max_nodes = 6  # cap nodes shown per level so a big tree never floods the screen
+    for depth, level in enumerate(snap["levels"]):
+        shown = level[:max_nodes]
+        extra = len(level) - len(shown)
+        if level and level[0]["leaf"]:
+            out(f"level {depth} (leaves, linked left->right):")
+            parts = [f"page {n['page']} {_fmt_keys(n['keys'])}" for n in shown]
+            line = "  " + "  ->  ".join(parts)
+            if extra > 0:
+                line += f"  ->  ... (+{extra} more leaves)"
+            out(line)
+        else:
+            label = "root, internal" if depth == 0 else "internal"
+            out(f"level {depth} ({label}):")
+            for n in shown:
+                out(f"  page {n['page']}: keys {_fmt_keys(n['keys'])}")
+            if extra > 0:
+                out(f"  ... (+{extra} more nodes)")
+
+
 def _meta(db: Database, line: str, out: Callable[..., None], color: bool = False) -> bool:
     """Handle a '.' meta-command. Return False to quit the shell."""
     parts = line[1:].split()
@@ -210,6 +248,11 @@ def _meta(db: Database, line: str, out: Callable[..., None], color: bool = False
             out("usage: .pages <table>")
         else:
             _meta_pages(db, parts[1], out, color)
+    elif cmd == "tree":
+        if len(parts) < 2:
+            out("usage: .tree <index>")
+        else:
+            _meta_tree(db, parts[1], out, color)
     elif cmd == "recommend":
         recs = db.recommend_indexes()
         if not recs:

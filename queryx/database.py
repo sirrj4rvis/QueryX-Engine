@@ -174,6 +174,25 @@ class Database:
             })
         return layout
 
+    def index_structure(self, name: str) -> dict:
+        """Read-only structural snapshot of a B+ tree index (for the shell's .tree).
+
+        Returns {name, kind, height, max_keys, levels}. Raises QueryError for a
+        hash index, which has no tree to draw. Read-only: opens and reads the
+        index, changing nothing.
+        """
+        info = self.catalog.get_index(name)  # raises CatalogError if missing
+        if info.kind != "btree":
+            raise QueryError(f"index {name!r} is a {info.kind} index; .tree is only for B+ trees")
+        index = self._index(name)
+        return {
+            "name": name,
+            "kind": info.kind,
+            "height": index.height(),          # type: ignore[attr-defined]
+            "max_keys": index.max_keys,         # type: ignore[attr-defined]
+            "levels": index.node_levels(),      # type: ignore[attr-defined]
+        }
+
     def simulate_crash(self) -> None:
         """Test/demo: abandon all open files WITHOUT checkpointing, leaving each
         pager's WAL intact so the next open recovers. Mimics a process crash."""

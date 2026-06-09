@@ -177,6 +177,54 @@ def test_meta_pages_requires_table(tmp_path):
     assert "usage: .pages" in out
 
 
+def test_tree_small_index(tmp_path):
+    out = drive(tmp_path, [
+        "CREATE TABLE t (id INT, v INT);",
+        "INSERT INTO t VALUES (10, 1), (20, 2), (30, 3);",
+        "CREATE INDEX idx_id ON t (id);",
+        ".tree idx_id",
+        "SELECT v FROM t WHERE id = 20;",  # read-only: the index still works after .tree
+    ])
+    assert "B+ tree 'idx_id'" in out
+    assert "height 1" in out
+    assert "leaves" in out
+    assert "10" in out and "20" in out and "30" in out  # keys shown
+    assert "(1 row)" in out                              # SELECT still returns the row
+
+
+def test_tree_multilevel(tmp_path):
+    rows = ", ".join(f"({i}, {i})" for i in range(300))  # enough keys to force a split
+    out = drive(tmp_path, [
+        "CREATE TABLE t (id INT, v INT);",
+        f"INSERT INTO t VALUES {rows};",
+        "CREATE INDEX idx_id ON t (id);",
+        ".tree idx_id",
+    ])
+    assert "B+ tree 'idx_id'" in out
+    assert "internal" in out   # multi-level tree -> a root/internal node is shown
+    assert "leaves" in out
+
+
+def test_tree_unknown_index(tmp_path):
+    out = drive(tmp_path, [".tree nope"])
+    assert "Error:" in out
+
+
+def test_tree_requires_arg(tmp_path):
+    out = drive(tmp_path, [".tree"])
+    assert "usage: .tree" in out
+
+
+def test_tree_rejects_hash_index(tmp_path):
+    lines = ["CREATE TABLE t (id INT, v INT);"]
+    lines += [f"INSERT INTO t VALUES ({i}, {i});" for i in range(20)]
+    lines += [f"SELECT v FROM t WHERE id = {i};" for i in range(6)]  # equality workload
+    lines += [".apply", ".tree auto_t_id"]
+    out = drive(tmp_path, lines)
+    assert "auto_t_id" in out     # advisor created a hash index
+    assert "hash index" in out    # .tree refuses it (B+ trees only)
+
+
 def test_recommend_and_apply(tmp_path):
     # advisor default threshold is 5; issue enough equality queries to trigger it
     lines = ["CREATE TABLE t (id INT, v INT);"]

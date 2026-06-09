@@ -127,9 +127,9 @@ storage
 ```
 
 Meta-commands: `.help`, `.tables`, `.schema`, `.indexes`, `.stats` (buffer-pool
-hit ratio), `.pages` (on-disk slotted-page layout), `.recommend` / `.apply`
-(index advisor), `.quit`. A paste-ready tour of every feature is in
-[examples/sample_queries.sql](examples/sample_queries.sql).
+hit ratio), `.pages` (on-disk slotted-page layout), `.tree` (a B+ tree index as
+static ASCII), `.recommend` / `.apply` (index advisor), `.quit`. A paste-ready
+tour of every feature is in [examples/sample_queries.sql](examples/sample_queries.sql).
 
 ---
 
