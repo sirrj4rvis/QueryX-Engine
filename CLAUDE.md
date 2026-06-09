@@ -103,4 +103,4 @@ A clean GitHub repo with: the engine, B+ tree + hash index, SQL parser with docu
 
 ## Current status
 
-Phase 0 complete and understanding check passed. **Starting fresh at Phase 1 — no code exists yet.** Begin with Phase 1: scaffold the structure above (empty modules with docstrings explaining each module's responsibility, plus README/DESIGN/pyproject/.gitignore), explain the architecture, then ask the Phase 1 understanding-check questions before proceeding to Phase 2.
+Status: Engine complete and frozen — all phases built and working. Now in showcase/polish mode. See SHOWCASE.md for current work.
