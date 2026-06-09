@@ -208,6 +208,29 @@ db.execute("SELECT COUNT(*), AVG(age) FROM users").rows  # [(2, 27.5)]
 db.close()  # data persists to disk; reopen Database("mydb") to read it back
 ```
 
+### Interactive shell
+
+For a hands-on REPL, launch the shell on a database directory and type SQL
+(terminated by `;`); meta-commands start with `.` (`.help`, `.tables`,
+`.schema`, `.indexes`, `.recommend`, `.apply`, `.quit`):
+
+```bash
+python -m queryx mydb
+```
+
+```
+queryx> SELECT name, age FROM users WHERE age >= 30 ORDER BY name;
+name  | age
+------+----
+alice | 30
+carol | 30
+(2 rows)
+queryx> EXPLAIN SELECT name FROM users WHERE id = 2;
+Projection: name
+  -> Filter: id = 2
+    -> SeqScan on users  (cost=1.0 rows=0)
+```
+
 ---
 
 ## Future work / explicitly out of scope

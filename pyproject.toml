@@ -17,6 +17,9 @@ keywords = ["database", "btree", "sql", "storage-engine", "query-optimizer", "wa
 # the test and benchmark tooling below.
 dependencies = []
 
+[project.scripts]
+queryx = "queryx.shell:main"
+
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 bench = ["matplotlib>=3.8"]
