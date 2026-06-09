@@ -30,6 +30,7 @@ class TokenType(Enum):
     SEMICOLON = auto()  # ;
     STAR = auto()       # *   (SELECT *, COUNT(*))
     MINUS = auto()      # -   (unary minus on a numeric literal)
+    DOT = auto()        # .   (qualified column: table.column)
 
     # comparison operators
     EQ = auto()         # =
@@ -52,6 +53,8 @@ class TokenType(Enum):
     WHERE = auto()
     ORDER = auto()
     BY = auto()
+    GROUP = auto()
+    HAVING = auto()
     ASC = auto()
     DESC = auto()
     LIMIT = auto()
@@ -60,6 +63,7 @@ class TokenType(Enum):
     DELETE = auto()
     INDEX = auto()
     ON = auto()
+    JOIN = auto()
     EXPLAIN = auto()
     AND = auto()
     OR = auto()
@@ -94,6 +98,8 @@ KEYWORDS: dict[str, TokenType] = {
     "WHERE": TokenType.WHERE,
     "ORDER": TokenType.ORDER,
     "BY": TokenType.BY,
+    "GROUP": TokenType.GROUP,
+    "HAVING": TokenType.HAVING,
     "ASC": TokenType.ASC,
     "DESC": TokenType.DESC,
     "LIMIT": TokenType.LIMIT,
@@ -102,6 +108,7 @@ KEYWORDS: dict[str, TokenType] = {
     "DELETE": TokenType.DELETE,
     "INDEX": TokenType.INDEX,
     "ON": TokenType.ON,
+    "JOIN": TokenType.JOIN,
     "EXPLAIN": TokenType.EXPLAIN,
     "AND": TokenType.AND,
     "OR": TokenType.OR,

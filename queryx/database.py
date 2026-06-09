@@ -35,12 +35,15 @@ from dataclasses import dataclass
 
 from queryx.catalog import Catalog, CatalogError, ColumnInfo
 from queryx.execution.operators import (
-    Aggregate, Distinct, Filter, IndexScan, Limit, Operator, Projection, SeqScan, Sort,
+    Aggregate, Distinct, Filter, HashAggregate, IndexNestedLoopJoin, IndexScan,
+    Limit, NestedLoopJoin, Operator, Projection, SeqScan, Sort, aggregates_in,
+    column_index,
 )
 from queryx.index.btree import BPlusTree
 from queryx.index.hash_index import HashIndex
+from queryx.planner.advisor import IndexRecommendation, WorkloadAdvisor
 from queryx.planner.explain import format_plan
-from queryx.planner.optimizer import AccessPath, choose_access_path
+from queryx.planner.optimizer import AccessPath, choose_access_path, sargable_comparisons
 from queryx.planner.statistics import TableStats
 from queryx.sql import ast
 from queryx.sql.parser import parse
@@ -73,7 +76,7 @@ class QueryResult:
 class Database:
     """Top-level facade: open a database directory and run SQL against it."""
 
-    def __init__(self, directory: str, use_wal: bool = True) -> None:
+    def __init__(self, directory: str, use_wal: bool = True, advisor_min_uses: int = 5) -> None:
         self.directory = directory
         self._use_wal = use_wal  # disable only for benchmarking WAL overhead
         os.makedirs(directory, exist_ok=True)
@@ -81,6 +84,8 @@ class Database:
         # Open storage objects, lazily created/cached, keyed by logical name.
         self._tables: dict[str, tuple[Pager, HeapFile]] = {}
         self._indexes: dict[str, tuple[Pager, object]] = {}
+        # Adaptive indexing: observes filtered columns to recommend indexes.
+        self.advisor = WorkloadAdvisor(min_uses=advisor_min_uses)
 
     # -- public API ---------------------------------------------------------
 
@@ -177,18 +182,22 @@ class Database:
         return None
 
     def _create_index(self, stmt: ast.CreateIndex) -> None:
-        table_info = self.catalog.get_table(stmt.table)
-        if table_info.columns[table_info.position(stmt.column)].type != ColumnType.INT:
+        self._create_index_impl(stmt.name, stmt.table, stmt.column, kind="btree")
+        return None
+
+    def _create_index_impl(self, name: str, table: str, column: str, kind: str) -> None:
+        """Create an index of the given kind and populate it from existing rows."""
+        table_info = self.catalog.get_table(table)
+        if table_info.columns[table_info.position(column)].type != ColumnType.INT:
             raise QueryError(
-                f"index requires an INT column; {stmt.table}.{stmt.column} is not INT "
+                f"index requires an INT column; {table}.{column} is not INT "
                 "(index keys are integers in QueryX)"
             )
-        self.catalog.create_index(stmt.name, stmt.table, stmt.column, kind="btree")
-        # Populate the new index from the table's existing rows.
-        index = self._index(stmt.name)
-        heap = self._heap(stmt.table)
+        self.catalog.create_index(name, table, column, kind=kind)
+        index = self._index(name)  # reads the kind back from the catalog
+        heap = self._heap(table)
         types = table_info.column_types
-        pos = table_info.position(stmt.column)
+        pos = table_info.position(column)
         distinct_keys: set = set()
         for rid, record in heap.scan():
             key = deserialize_row(types, record)[pos]
@@ -196,8 +205,24 @@ class Database:
             distinct_keys.add(key)
         index.flush()  # type: ignore[attr-defined]
         # Record the column statistic the optimizer uses for equality selectivity.
-        self.catalog.set_index_stats(stmt.name, len(distinct_keys))
-        return None
+        self.catalog.set_index_stats(name, len(distinct_keys))
+
+    # -- adaptive indexing (Phase 9c) --------------------------------------
+
+    def recommend_indexes(self) -> list[IndexRecommendation]:
+        """Indexes the workload advisor suggests, given the queries seen so far."""
+        return self.advisor.recommend(self.catalog)
+
+    def apply_recommendations(self) -> list[str]:
+        """Create every recommended index; return the names created."""
+        created = []
+        for rec in self.recommend_indexes():
+            name = f"auto_{rec.table}_{rec.column}"
+            if self.catalog.has_index(name):
+                continue
+            self._create_index_impl(name, rec.table, rec.column, rec.kind)
+            created.append(name)
+        return created
 
     def _drop_index(self, stmt: ast.DropIndex) -> None:
         self.catalog.drop_index(stmt.name)  # validates existence
@@ -281,27 +306,29 @@ class Database:
     # -- SELECT (the Phase 5 deliverable) -----------------------------------
 
     def _select(self, stmt: ast.Select) -> QueryResult:
+        if stmt.join is not None:
+            return self._select_join(stmt)
+
         table_info = self.catalog.get_table(stmt.table)
-        types = table_info.column_types
-        names = table_info.column_names
 
-        # Validate every referenced column exists.
-        referenced = set(self._columns_in(stmt.where)) if stmt.where else set()
-        if stmt.order_by:
-            referenced.update(o.column for o in stmt.order_by)
-        self._validate_columns(table_info, referenced)
-
-        aggregates = [p for p in stmt.projections if isinstance(p, ast.Aggregate)]
-        stars = [p for p in stmt.projections if isinstance(p, ast.Star)]
+        # Validate WHERE columns; ORDER BY validation depends on the path below.
+        if stmt.where is not None:
+            self._validate_columns(table_info, set(self._columns_in(stmt.where)))
 
         # Cost-based access-path selection (SeqScan vs IndexScan + residual).
         root: Operator = self._build_scan(table_info, stmt.table, stmt.where)
+
+        if stmt.group_by is not None:
+            return self._select_grouped(stmt, table_info, root)
+
+        aggregates = [p for p in stmt.projections if isinstance(p, ast.Aggregate)]
+        stars = [p for p in stmt.projections if isinstance(p, ast.Star)]
 
         if aggregates:
             if len(aggregates) != len(stmt.projections):
                 raise QueryError("cannot mix aggregates with plain columns (no GROUP BY)")
             if stmt.distinct or stmt.order_by:
-                raise QueryError("DISTINCT/ORDER BY are not supported with aggregates")
+                raise QueryError("DISTINCT/ORDER BY are not supported with scalar aggregates")
             for agg in aggregates:
                 if isinstance(agg.arg, ast.Column):
                     self._validate_columns(table_info, {agg.arg.name})
@@ -313,6 +340,7 @@ class Database:
             raise QueryError("cannot combine * with other select items")
 
         if stmt.order_by:  # sort full rows so ORDER BY may reference any column
+            self._validate_columns(table_info, {o.column for o in stmt.order_by})
             root = Sort(root, stmt.order_by)
 
         if not stars:  # explicit column list
@@ -327,6 +355,150 @@ class Database:
 
         return QueryResult(columns=list(root.column_names), rows=list(root))
 
+    def _select_grouped(self, stmt: ast.Select, table_info, root: Operator) -> QueryResult:
+        """Build the GROUP BY pipeline: scan -> HashAggregate -> (order/limit)."""
+        group_by = stmt.group_by
+        self._validate_columns(table_info, set(group_by))
+
+        for p in stmt.projections:
+            if isinstance(p, ast.Star):
+                raise QueryError("SELECT * is not supported with GROUP BY")
+            if isinstance(p, ast.Column):
+                if p.name not in group_by:
+                    raise QueryError(f"column {p.name!r} must appear in GROUP BY or be aggregated")
+            elif isinstance(p, ast.Aggregate) and isinstance(p.arg, ast.Column):
+                self._validate_columns(table_info, {p.arg.name})
+
+        if stmt.having is not None:
+            for col in self._columns_in(stmt.having):  # plain columns (aggregate args excluded)
+                if col not in group_by:
+                    raise QueryError(f"HAVING column {col!r} must be a GROUP BY column or aggregated")
+            for agg in aggregates_in(stmt.having):
+                if isinstance(agg.arg, ast.Column):
+                    self._validate_columns(table_info, {agg.arg.name})
+
+        root = HashAggregate(root, group_by, stmt.projections, stmt.having)
+
+        if stmt.order_by:  # in a grouped query, ORDER BY must name a selected output column
+            output = set(root.column_names)
+            for o in stmt.order_by:
+                if o.column not in output:
+                    raise QueryError(f"ORDER BY {o.column!r} must be a selected column in a GROUP BY query")
+            root = Sort(root, stmt.order_by)
+        if stmt.distinct:
+            root = Distinct(root)
+        if stmt.limit is not None:
+            root = Limit(root, stmt.limit)
+
+        return QueryResult(columns=list(root.column_names), rows=list(root))
+
+    def _select_join(self, stmt: ast.Select) -> QueryResult:
+        """Build a two-table INNER JOIN pipeline (nested-loop or index-nested-loop)."""
+        left_info = self.catalog.get_table(stmt.table)
+        right_info = self.catalog.get_table(stmt.join.table)
+        if stmt.group_by is not None or any(isinstance(p, ast.Aggregate) for p in stmt.projections):
+            raise QueryError("GROUP BY and aggregates are not supported with JOIN")
+
+        left_alias = stmt.table_alias or stmt.table
+        right_alias = stmt.join.alias or stmt.join.table
+        if left_alias == right_alias:
+            raise QueryError("the two join inputs need distinct names/aliases")
+
+        left_qual = [f"{left_alias}.{c}" for c in left_info.column_names]
+        right_qual = [f"{right_alias}.{c}" for c in right_info.column_names]
+        cidx = column_index(left_qual + right_qual)
+
+        self._validate_keys(self._referenced_keys(stmt.join.on), cidx, "ON")
+        if stmt.where is not None:
+            self._validate_keys(self._referenced_keys(stmt.where), cidx, "WHERE")
+
+        left_scan = SeqScan(self._heap(stmt.table), left_qual, left_info.column_types)
+        root: Operator = self._build_join(
+            stmt, right_info, left_alias, right_alias, right_qual, left_scan
+        )
+
+        if stmt.where is not None:
+            root = Filter(root, stmt.where)
+        if stmt.order_by:
+            for o in stmt.order_by:
+                if o.column not in cidx:
+                    raise QueryError(f"ORDER BY {o.column!r} is not a column of the joined result")
+            root = Sort(root, stmt.order_by)
+
+        stars = [p for p in stmt.projections if isinstance(p, ast.Star)]
+        if stars and len(stmt.projections) > 1:
+            raise QueryError("cannot combine * with other select items")
+        if not stars:
+            names = []
+            for p in stmt.projections:
+                if not isinstance(p, ast.Column):
+                    raise QueryError("only column projections are supported with JOIN")
+                if p.key not in cidx:
+                    raise QueryError(f"unknown column {p.key!r} in the joined result")
+                names.append(p.key)
+            root = Projection(root, names)
+
+        if stmt.distinct:
+            root = Distinct(root)
+        if stmt.limit is not None:
+            root = Limit(root, stmt.limit)
+        return QueryResult(columns=list(root.column_names), rows=list(root))
+
+    def _build_join(self, stmt, right_info, left_alias, right_alias, right_qual, left_scan):
+        """Pick index-nested-loop when the join is an equijoin on an indexed right column."""
+        equi = self._equijoin(stmt.join.on, left_alias, right_alias)
+        if equi is not None:
+            left_key, _right_key, right_col = equi
+            info = self.catalog.index_on(stmt.join.table, right_col)
+            if info is not None:
+                index = self._index(info.name)
+                return IndexNestedLoopJoin(
+                    left_scan, self._heap(stmt.join.table), index, left_key,
+                    right_qual, right_info.column_types,
+                )
+        right_scan = SeqScan(self._heap(stmt.join.table), right_qual, right_info.column_types)
+        return NestedLoopJoin(left_scan, right_scan, stmt.join.on)
+
+    @staticmethod
+    def _equijoin(on, left_alias, right_alias):
+        """If ``on`` is ``left_alias.x = right_alias.y`` (either order), return
+        (left_key_qualified, right_key_qualified, right_bare_column); else None."""
+        if not isinstance(on, ast.Comparison) or on.op != TokenType.EQ:
+            return None
+        if not (isinstance(on.left, ast.Column) and isinstance(on.right, ast.Column)):
+            return None
+
+        def side(col):
+            if col.table == left_alias:
+                return "L"
+            if col.table == right_alias:
+                return "R"
+            return None
+
+        sl, sr = side(on.left), side(on.right)
+        if {sl, sr} != {"L", "R"}:
+            return None
+        left_col, right_col = (on.left, on.right) if sl == "L" else (on.right, on.left)
+        return (f"{left_alias}.{left_col.name}", f"{right_alias}.{right_col.name}", right_col.name)
+
+    def _referenced_keys(self, expr: ast.Expr) -> set[str]:
+        """Lookup keys (qualified or bare) of every column referenced in a predicate."""
+        if isinstance(expr, ast.Column):
+            return {expr.key}
+        if isinstance(expr, ast.Comparison):
+            return self._referenced_keys(expr.left) | self._referenced_keys(expr.right)
+        if isinstance(expr, (ast.And, ast.Or)):
+            return self._referenced_keys(expr.left) | self._referenced_keys(expr.right)
+        if isinstance(expr, ast.Not):
+            return self._referenced_keys(expr.operand)
+        return set()
+
+    @staticmethod
+    def _validate_keys(keys: set[str], column_idx: dict, clause: str) -> None:
+        for key in keys:
+            if key not in column_idx:
+                raise QueryError(f"unknown or ambiguous column {key!r} in {clause}")
+
     # -- planning helpers ---------------------------------------------------
 
     def _table_stats(self, table: str) -> TableStats:
@@ -340,10 +512,16 @@ class Database:
         n_distinct = {i.column: i.n_distinct for i in indexes if i.n_distinct is not None}
         return choose_access_path(where, self._table_stats(table_info.name), indexes, n_distinct)
 
+    _RANGE_OPS = (TokenType.LT, TokenType.GT, TokenType.LTE, TokenType.GTE)
+
     def _build_scan(self, table_info, table: str, where) -> Operator:
         """Build the scan (+ residual Filter) the optimizer chose."""
         heap = self._heap(table)
         names, types = table_info.column_names, table_info.column_types
+        # Adaptive indexing: note which columns this query filters on.
+        for column, op, _value in sargable_comparisons(where):
+            if table_info.has_column(column):
+                self.advisor.record_predicate(table, column, op in self._RANGE_OPS)
         ap = self._access_path(table_info, where)
         if ap.method == "IndexScan":
             index = self._index(ap.index_name)
@@ -375,6 +553,8 @@ class Database:
         raise QueryError(f"unsupported index operator {op}")  # pragma: no cover
 
     def _explain(self, select: ast.Select) -> str:
+        if select.join is not None:
+            return self._explain_join(select)
         table_info = self.catalog.get_table(select.table)
         referenced = set(self._columns_in(select.where)) if select.where else set()
         if select.order_by:
@@ -383,6 +563,47 @@ class Database:
         indexes = self.catalog.indexes_for_table(select.table)
         n_distinct = {i.column: i.n_distinct for i in indexes if i.n_distinct is not None}
         return format_plan(select, table_info, self._table_stats(select.table), indexes, n_distinct)
+
+    def _explain_join(self, select: ast.Select) -> str:
+        from queryx.planner.explain import expr_to_str
+
+        left_alias = select.table_alias or select.table
+        right_alias = select.join.alias or select.join.table
+        equi = self._equijoin(select.join.on, left_alias, right_alias)
+        method = "NestedLoopJoin"
+        right_leaf = f"SeqScan on {select.join.table} (as {right_alias})"
+        if equi is not None:
+            _lk, _rk, right_col = equi
+            info = self.catalog.index_on(select.join.table, right_col)
+            if info is not None:
+                method = "IndexNestedLoopJoin"
+                right_leaf = f"IndexScan on {select.join.table} (as {right_alias}) using {info.name}"
+
+        lines: list[str] = []
+        depth = 0
+
+        def emit(text: str) -> None:
+            nonlocal depth
+            lines.append("  " * depth + ("-> " if depth else "") + text)
+            depth += 1
+
+        if select.limit is not None:
+            emit(f"Limit: {select.limit}")
+        if select.distinct:
+            emit("Distinct")
+        if not any(isinstance(p, ast.Star) for p in select.projections):
+            cols = ", ".join(p.key for p in select.projections if isinstance(p, ast.Column))
+            emit(f"Projection: {cols}")
+        if select.order_by:
+            keys = ", ".join(f"{o.column}{' DESC' if o.descending else ''}" for o in select.order_by)
+            emit(f"Sort: {keys}")
+        if select.where is not None:
+            emit(f"Filter: {expr_to_str(select.where)}")
+        emit(f"{method}  [{expr_to_str(select.join.on)}]")
+        child = "  " * depth + "-> "
+        lines.append(child + f"SeqScan on {select.table} (as {left_alias})")
+        lines.append(child + right_leaf)
+        return "\n".join(lines)
 
     # -- helpers ------------------------------------------------------------
 

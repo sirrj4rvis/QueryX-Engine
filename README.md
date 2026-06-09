@@ -8,10 +8,11 @@ built from first principles to expose the internals that production databases
 B+ tree and hash indexing, SQL parsing, volcano-model execution, cost-based
 query optimization, and write-ahead logging with crash recovery.
 
-> **Status:** Phase 8 complete — benchmark suite. All core phases done: a working
-> SQL database with page storage, B+ tree/hash indexes, a cost-based optimizer,
-> WAL crash recovery, and a charted benchmark suite. Only the optional Phase 9
-> stretch remains. See the roadmap and benchmarks below.
+> **Status:** Complete (Phases 1–9). A working SQL database with page storage,
+> B+ tree/hash indexes, a cost-based optimizer with `EXPLAIN`, WAL crash
+> recovery, a charted benchmark suite, and all three Phase 9 stretch goals —
+> `GROUP BY`/`HAVING`, two-table `INNER JOIN` (nested-loop + index-nested-loop),
+> and adaptive indexing. 306 passing tests.
 
 ---
 
@@ -105,7 +106,8 @@ per-phase engineering notes.
   ```
 - [x] **Phase 7** — WAL + crash recovery (redo logging + replay).
 - [x] **Phase 8** — Benchmark suite with matplotlib charts.
-- [ ] **Phase 9** — *(optional)* one stretch goal: adaptive indexing **or** one Tier 3 SQL feature.
+- [x] **Phase 9** — *(stretch, all three built)* `GROUP BY` + `HAVING`, two-table
+  `INNER JOIN` (nested-loop + index-nested-loop), and adaptive indexing.
 
 ---
 
@@ -116,13 +118,15 @@ QueryX deliberately supports a **focused, fully integrated subset** of SQL — n
 optimizer → executor → indexes → storage), never string-matched.
 
 - **Supported:** `CREATE TABLE`, `DROP TABLE`, `INSERT`,
-  `SELECT [DISTINCT] cols FROM t WHERE <predicate> [ORDER BY] [LIMIT]`,
-  `UPDATE`, `DELETE`, `CREATE INDEX`, `DROP INDEX`; comparison operators
-  `= != <> < > <= >=` combined with `AND OR NOT`; scalar aggregates
-  `COUNT(*) SUM AVG MIN MAX` (no `GROUP BY`).
-- **Deferred (future work):** subqueries, `LIKE`, `IN`, joins beyond a single
-  optional two-table join, foreign keys, views, full three-valued `NULL` logic,
-  and `BEGIN/COMMIT/ROLLBACK` transactions.
+  `SELECT [DISTINCT] cols FROM t [JOIN t2 ON ...] WHERE <predicate>
+  [GROUP BY ... HAVING ...] [ORDER BY] [LIMIT]`, `UPDATE`, `DELETE`,
+  `CREATE INDEX`, `DROP INDEX`, `EXPLAIN`; comparison operators
+  `= != <> < > <= >=` combined with `AND OR NOT`; aggregates
+  `COUNT(*) SUM AVG MIN MAX` with or without `GROUP BY`; a two-table
+  `INNER JOIN`.
+- **Deferred (future work):** subqueries, `LIKE`, `IN`, joins beyond two
+  tables, foreign keys, views, full three-valued `NULL` logic, and
+  `BEGIN/COMMIT/ROLLBACK` transactions.
 
 ---
 

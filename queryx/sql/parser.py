@@ -115,13 +115,48 @@ class Parser:
         projections = self._select_list()
         self._expect(TokenType.FROM, "FROM")
         table = self._identifier("a table name")
+        table_alias = self._optional_alias()
+        join = self._optional_join()
         where = self._optional_where()
+        group_by, having = self._optional_group_by()
         order_by = self._optional_order_by()
         limit = self._optional_limit()
         return ast.Select(
             table=table, projections=projections, distinct=distinct,
-            where=where, order_by=order_by, limit=limit,
+            where=where, group_by=group_by, having=having,
+            order_by=order_by, limit=limit, table_alias=table_alias, join=join,
         )
+
+    def _optional_alias(self) -> Optional[str]:
+        """A bare identifier right after a table name is its alias (no AS keyword)."""
+        if self._check(TokenType.IDENT):
+            return self._advance().lexeme
+        return None
+
+    def _optional_join(self) -> Optional[ast.Join]:
+        if not self._match(TokenType.JOIN):
+            return None
+        table = self._identifier("a table name to join")
+        alias = self._optional_alias()
+        self._expect(TokenType.ON, "ON after the joined table")
+        return ast.Join(table=table, alias=alias, on=self._expression())
+
+    def _column_ref(self) -> ast.Column:
+        """Parse a column reference: ``name`` or qualified ``qualifier.name``."""
+        first = self._identifier("a column name")
+        if self._match(TokenType.DOT):
+            return ast.Column(self._identifier("a column name after '.'"), table=first)
+        return ast.Column(first)
+
+    def _optional_group_by(self) -> tuple[Optional[list[str]], Optional[ast.Expr]]:
+        if not self._match(TokenType.GROUP):
+            return None, None
+        self._expect(TokenType.BY, "BY after GROUP")
+        columns = [self._identifier("a column name in GROUP BY")]
+        while self._match(TokenType.COMMA):
+            columns.append(self._identifier("a column name in GROUP BY"))
+        having = self._expression() if self._match(TokenType.HAVING) else None
+        return columns, having
 
     def _select_list(self) -> list[ast.Expr]:
         items = [self._select_item()]
@@ -134,7 +169,7 @@ class Parser:
             return ast.Star()
         if self._peek().type in _AGGREGATES:
             return self._aggregate()
-        return ast.Column(self._identifier("a column name"))
+        return self._column_ref()
 
     def _aggregate(self) -> ast.Aggregate:
         func = _AGGREGATES[self._advance().type]
@@ -142,7 +177,7 @@ class Parser:
         if func == "COUNT" and self._match(TokenType.STAR):
             arg: ast.Expr = ast.Star()
         else:
-            arg = ast.Column(self._identifier("a column name inside the aggregate"))
+            arg = self._column_ref()
         self._expect(TokenType.RPAREN, "')' to close the aggregate")
         return ast.Aggregate(func=func, arg=arg)
 
@@ -162,6 +197,8 @@ class Parser:
 
     def _order_item(self) -> ast.OrderItem:
         column = self._identifier("a column name in ORDER BY")
+        if self._match(TokenType.DOT):  # qualified, e.g. ORDER BY u.name
+            column = f"{column}.{self._identifier('a column name after .')}"
         descending = False
         if self._match(TokenType.DESC):
             descending = True
@@ -210,6 +247,8 @@ class Parser:
             inner = self._expression()
             self._expect(TokenType.RPAREN, "')' to close a parenthesized expression")
             return inner
+        if self._peek().type in _AGGREGATES:
+            return self._aggregate()  # e.g. HAVING COUNT(*) > 1
         return self._literal_or_column()
 
     def _literal_or_column(self) -> ast.Expr:
@@ -223,7 +262,7 @@ class Parser:
         if self._check(TokenType.STRING):
             return ast.Literal(value=self._advance().value, type=ColumnType.TEXT)
         if self._check(TokenType.IDENT):
-            return ast.Column(self._advance().lexeme)
+            return self._column_ref()
         raise self._error("expected a column, number, or string")
 
     # -- INSERT -------------------------------------------------------------

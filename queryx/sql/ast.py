@@ -43,8 +43,14 @@ class Statement(Node):
 
 @dataclass
 class Column(Expr):
-    """A column reference, e.g. ``age``."""
+    """A column reference, e.g. ``age`` or qualified ``u.age`` (table = 'u')."""
     name: str
+    table: Optional[str] = None  # the qualifier (alias or table name), if written
+
+    @property
+    def key(self) -> str:
+        """The lookup key: 'table.name' if qualified, else 'name'."""
+        return f"{self.table}.{self.name}" if self.table else self.name
 
 
 @dataclass
@@ -121,6 +127,14 @@ class Assignment:
     value: Expr
 
 
+@dataclass
+class Join:
+    """An INNER JOIN target: the right table, its optional alias, and ON predicate."""
+    table: str
+    alias: Optional[str]
+    on: Expr
+
+
 # ---------------------------------------------------------------------------
 # Statements
 # ---------------------------------------------------------------------------
@@ -150,8 +164,12 @@ class Select(Statement):
     projections: list[Expr]              # Column / Star / Aggregate
     distinct: bool = False
     where: Optional[Expr] = None
+    group_by: Optional[list[str]] = None  # columns to group on
+    having: Optional[Expr] = None         # post-aggregation filter (needs group_by)
     order_by: Optional[list[OrderItem]] = None
     limit: Optional[int] = None
+    table_alias: Optional[str] = None     # alias for the FROM table (joins)
+    join: Optional[Join] = None           # optional second table (INNER JOIN)
 
 
 @dataclass

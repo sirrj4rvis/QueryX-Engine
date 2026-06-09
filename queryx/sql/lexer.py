@@ -125,6 +125,8 @@ class Lexer:
             self._add(TokenType.RPAREN, ch, start)
         elif ch == ";":
             self._add(TokenType.SEMICOLON, ch, start)
+        elif ch == ".":
+            self._add(TokenType.DOT, ch, start)
         elif ch == "*":
             self._add(TokenType.STAR, ch, start)
         elif ch == "-":

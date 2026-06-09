@@ -100,15 +100,18 @@ insert         ::= "INSERT" "INTO" ident [ "(" ident { "," ident } ")" ]
                    "VALUES" "(" value { "," value } ")"
 
 select         ::= "SELECT" [ "DISTINCT" ] select_list
-                   "FROM" ident
+                   "FROM" table_ref [ "JOIN" table_ref "ON" expr ]   (Phase 9b)
                    [ "WHERE" expr ]
+                   [ "GROUP" "BY" colref { "," colref } [ "HAVING" expr ] ]  (Phase 9a)
                    [ "ORDER" "BY" order_item { "," order_item } ]
                    [ "LIMIT" number ]
+table_ref      ::= ident [ ident ]            (* table with optional alias *)
 select_list    ::= "*" | select_item { "," select_item }
-select_item    ::= aggregate | ident
-aggregate      ::= "COUNT" "(" ( "*" | ident ) ")"
-                 | ( "SUM" | "AVG" | "MIN" | "MAX" ) "(" ident ")"
-order_item     ::= ident [ "ASC" | "DESC" ]
+select_item    ::= aggregate | colref
+aggregate      ::= "COUNT" "(" ( "*" | colref ) ")"
+                 | ( "SUM" | "AVG" | "MIN" | "MAX" ) "(" colref ")"
+colref         ::= ident [ "." ident ]        (* qualified column: table.column *)
+order_item     ::= colref [ "ASC" | "DESC" ]
 
 update         ::= "UPDATE" ident "SET" assignment { "," assignment } [ "WHERE" expr ]
 assignment     ::= ident "=" value
@@ -119,7 +122,7 @@ or_expr        ::= and_expr { "OR" and_expr }
 and_expr       ::= not_expr { "AND" not_expr }
 not_expr       ::= "NOT" not_expr | comparison
 comparison     ::= primary [ ( "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=" ) primary ]
-primary        ::= "(" expr ")" | literal | ident
+primary        ::= "(" expr ")" | literal | aggregate | colref
 literal        ::= [ "-" ] number | string
 value          ::= literal
 ```
@@ -745,6 +748,55 @@ honest about its limits.
   gaps are meaningful.
 - *No concurrency.* Single-threaded throughput says nothing about contention,
   lock waits, or buffer-pool thrashing under a real multi-client workload.
+
+### Phase 9 — Stretch goals (all three)
+
+CLAUDE.md scopes Phase 9 as "pick at most one"; with the core rock-solid (277
+tests) all three were built as independent, fully-tested slices. Each is a real
+subsystem, kept honestly bounded.
+
+#### 9a — GROUP BY + HAVING
+
+Grouped aggregation via a **hash-aggregate** operator (`HashAggregate`): one
+streaming pass hashes each row into its group key and accumulates per-group
+state, then emits one row per group; `HAVING` filters groups afterward, able to
+reference both group columns and aggregates (the parser now allows aggregate
+calls inside predicates; the evaluator resolves them by label). *Decision:* hash
+aggregation over sort-based aggregation — O(rows) vs O(rows log rows) and simpler
+here. *Limits:* single pass in memory (a huge number of groups would not spill to
+disk); `ORDER BY` in a grouped query must name a selected output column.
+*Failure mode:* the in-memory group map is unbounded — a high-cardinality GROUP
+BY could exhaust RAM, where a real engine spills.
+
+#### 9b — Two-table INNER JOIN
+
+A `NestedLoopJoin` (materialize the right side, probe per left row, O(L×R)) and an
+`IndexNestedLoopJoin` (probe the right table's index per left row, O(L×log R));
+the optimizer picks the index variant when the ON clause is an equijoin on an
+indexed right column — index nested-loop is the join the Phase 6 cost model and
+Phase 3 indexes were building toward. This required **qualified column names**
+(`u.id`): the lexer gained a `.` token, the AST a column qualifier, and
+`column_index` resolves qualified names always and bare names only when
+unambiguous (an ambiguous bare `id` raises rather than guessing). *Decisions:*
+materialize the (small) right input rather than re-scan it; require both join
+keys qualified to detect the equijoin. *Limits:* two tables only, INNER only, no
+join reordering, no hash/merge join, no joins mixed with GROUP BY/aggregates.
+*Failure mode:* a large right side materialized in memory; and the plain
+nested-loop is quadratic — mitigated only when an index makes it index-nested-loop.
+
+#### 9c — Adaptive indexing
+
+A `WorkloadAdvisor` records every filtered (table, column) and whether by
+equality or range; `recommend()` proposes an index for any hot, unindexed, INT
+column — **hash** for equality-only demand, **B+ tree** when ranges appear — and
+`apply_recommendations()` creates them. This is a miniature of real "missing
+index" advisors (SQL Server DMVs, Postgres index-advisor extensions). *Decision:*
+observe-and-recommend (with optional auto-apply) rather than silently mutating
+the schema. *Limits:* single-column indexes, counts only (no cost-benefit
+modelling, no drop-unused recommendations), observes SELECT predicates only.
+*Failure mode:* recommendations can be wrong for a shifting workload (it never
+forgets old queries) — purely advisory, so a bad suggestion costs nothing until
+applied.
 
 ---
 
