@@ -77,9 +77,54 @@ A SQL string is transformed step by step as it descends the stack:
 
 ## 3. SQL grammar (BNF)
 
-> Filled in during **Phase 4**, when the parser is built. The grammar will
-> cover the supported subset listed in the README, with operator precedence
-> (`NOT` > comparison > `AND` > `OR`) documented explicitly.
+The grammar QueryX's recursive-descent parser accepts. Uppercase words are
+keywords (case-insensitive in practice); `{ x }` means zero or more; `[ x ]`
+means optional; `|` is choice. Expression precedence is encoded by the rule
+layering (loosest first): `OR` < `AND` < `NOT` < comparison < primary.
+
+```bnf
+statement      ::= ( select | insert | update | delete
+                   | create_table | drop_table | create_index | drop_index ) [ ";" ]
+
+create_table   ::= "CREATE" "TABLE" ident "(" column_def { "," column_def } ")"
+column_def     ::= ident ( "INT" | "INTEGER" | "TEXT" )
+drop_table     ::= "DROP" "TABLE" ident
+
+create_index   ::= "CREATE" "INDEX" ident "ON" ident "(" ident ")"
+drop_index     ::= "DROP" "INDEX" ident
+
+insert         ::= "INSERT" "INTO" ident [ "(" ident { "," ident } ")" ]
+                   "VALUES" "(" value { "," value } ")"
+
+select         ::= "SELECT" [ "DISTINCT" ] select_list
+                   "FROM" ident
+                   [ "WHERE" expr ]
+                   [ "ORDER" "BY" order_item { "," order_item } ]
+                   [ "LIMIT" number ]
+select_list    ::= "*" | select_item { "," select_item }
+select_item    ::= aggregate | ident
+aggregate      ::= "COUNT" "(" ( "*" | ident ) ")"
+                 | ( "SUM" | "AVG" | "MIN" | "MAX" ) "(" ident ")"
+order_item     ::= ident [ "ASC" | "DESC" ]
+
+update         ::= "UPDATE" ident "SET" assignment { "," assignment } [ "WHERE" expr ]
+assignment     ::= ident "=" value
+delete         ::= "DELETE" "FROM" ident [ "WHERE" expr ]
+
+expr           ::= or_expr
+or_expr        ::= and_expr { "OR" and_expr }
+and_expr       ::= not_expr { "AND" not_expr }
+not_expr       ::= "NOT" not_expr | comparison
+comparison     ::= primary [ ( "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=" ) primary ]
+primary        ::= "(" expr ")" | literal | ident
+literal        ::= [ "-" ] number | string
+value          ::= literal
+```
+
+Notes: comparison is non-associative (`a = b = c` is rejected). A leading `-`
+is unary minus on a numeric literal only. `SELECT *` and `COUNT(*)` are the only
+uses of `*`. The parser builds the AST in [ast.py](queryx/sql/ast.py); the
+grammar above maps one rule ≈ one parser method.
 
 ---
 
@@ -317,6 +362,79 @@ mechanics and simplify the rest, honestly flagged.
   across many leaves (B+ tree) or a long chain (hash); `search` must visit them
   all. Correct, but a single equality lookup is no longer cheap — a reason real
   systems sometimes prefer bitmap indexes for low-cardinality columns.
+
+### Phase 4 — SQL Parser
+
+**Problem solved.** Turn a SQL *string* into a structured AST the rest of the
+engine can act on, replacing method calls (`heap.insert`) with a real query
+language — without string-matching or special-casing any command.
+
+**The two stages.** `lexer.py` (a hand-written scanner) turns characters into a
+flat token stream — keywords vs. identifiers, number/string literals (with `''`
+escape), multi-char operators (`<=`, `>=`, `<>`, `!=`), whitespace and `--`
+comments. `parser.py` (recursive descent) turns tokens into the AST in
+`ast.py`. `tokens.py` holds the shared token vocabulary and the positioned
+`SQLSyntaxError`.
+
+**Key decisions and rejected alternatives.**
+
+1. **Hand-written recursive-descent parser.** One method per grammar rule, so
+   the code mirrors the BNF and is easy to read, extend, and debug — and it
+   produces clear positioned errors. *Rejected:* a parser generator
+   (PLY/Lark/ANTLR) — less code, but a third-party dependency (we are stdlib-
+   only for the engine) and a generated black box that teaches less.
+2. **Precedence by layered methods, not a precedence table.** `or_expr →
+   and_expr → not_expr → comparison → primary`; each layer climbs only to the
+   next-tighter one, so `OR` binds loosest and parentheses override. *Rejected:*
+   an explicit operator-precedence/Pratt parser — more general (needed for rich
+   arithmetic), but overkill for a fixed, small operator set.
+3. **Behavior-free AST dataclasses.** The AST is pure data, the clean contract
+   between parser and planner. Column types reuse `storage.page.ColumnType`
+   (a downward dependency, allowed) rather than duplicating an enum.
+
+**Complexity / scaling.** Both lexer and parser are O(n) in input length with
+bounded lookahead — each character/token is consumed a constant number of times.
+No backtracking. Not a bottleneck; parsing a statement is trivial next to
+executing it.
+
+**PostgreSQL / SQLite comparison.** Both use *generated* parsers — Postgres a
+Bison/yacc grammar, SQLite the bespoke Lemon generator — but the two-stage
+(lex → parse → tree) shape is identical to ours. Real SQL grammars are vastly
+larger (joins, subqueries, CTEs, window functions, full expression trees with
+arithmetic and functions). QueryX implements a focused subset by hand; the
+mechanism is faithful, the surface is deliberately small.
+
+**Engineering review — flaws, debt, simplifications.**
+
+- *Syntax only, no semantic validation.* The parser happily accepts
+  `SELECT ghost FROM nowhere` or `COUNT(*) , name` (mixing an aggregate with a
+  bare column, which is meaningless without GROUP BY). Catching unknown
+  tables/columns and illegal aggregate mixing is the planner/executor's job
+  (Phases 5-6) using the catalog — not done here.
+- *Integer-only numeric literals.* No floats/decimals; `AVG` will yield a float
+  at execution time but cannot be written as a literal. Documented gap.
+- *One statement per parse.* No multi-statement scripts beyond a single optional
+  trailing `;`.
+- *No qualified names / aliases* (`t.col`, `AS`), consistent with the
+  single-table, no-join scope.
+
+**Failure analysis — concrete scenarios.**
+
+- *Silent acceptance of nonsense.* Because there is no catalog check, a typo
+  like `WHERE aeg > 30` parses cleanly and only fails (or worse, returns wrong
+  results) downstream. The mitigation is name resolution against the catalog in
+  the executor; until then a parse success does NOT mean a valid query.
+- *Aggregate/column mix.* `SELECT COUNT(*), name FROM t` parses into a valid AST
+  but has no meaningful scalar-aggregate semantics; the executor must reject it
+  (we have no GROUP BY). A real planner raises "column must appear in GROUP BY".
+- *Integer literal overflow.* `INSERT ... VALUES (99999999999999999999)` lexes
+  into a Python int of arbitrary size, but the storage layer serializes INT as
+  8 bytes signed — the out-of-range value will raise (or, if unchecked, wrap) at
+  serialization time, not at parse time. The boundary check belongs at
+  insert/execution.
+- *Deep parenthesization nesting* recurses in Python; a pathological
+  `((((...))))` could hit the recursion limit. Real parsers cap nesting depth;
+  we do not. Not a concern for hand-written queries.
 
 ---
 

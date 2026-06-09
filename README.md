@@ -8,9 +8,9 @@ built from first principles to expose the internals that production databases
 B+ tree and hash indexing, SQL parsing, volcano-model execution, cost-based
 query optimization, and write-ahead logging with crash recovery.
 
-> **Status:** Phase 3 complete — index manager (disk-backed B+ tree + static
-> hash index, benchmarked against a heap seq scan). Builds on the Phase 2
-> storage engine. The engine is built one vertical phase at a time; see below.
+> **Status:** Phase 4 complete — SQL parser (hand-written lexer +
+> recursive-descent parser → AST, grammar in BNF). Builds on the Phase 2
+> storage engine and Phase 3 indexes. Built one vertical phase at a time; see below.
 
 ---
 
@@ -90,7 +90,7 @@ per-phase engineering notes.
   ```
   Point lookup: hash ~625x faster than a seq scan. Range scan: B+ tree only —
   a hash index has no ordering. Run: `python benchmarks/index_benchmark.py`
-- [ ] **Phase 4** — SQL parser: lexer + recursive-descent parser → AST (grammar in BNF).
+- [x] **Phase 4** — SQL parser: lexer + recursive-descent parser → AST (grammar in BNF).
 - [ ] **Phase 5** — Execution engine: volcano operators end-to-end.
 - [ ] **Phase 6** — Cost-based optimizer + `EXPLAIN`.
 - [ ] **Phase 7** — WAL + crash recovery (redo logging + replay).
